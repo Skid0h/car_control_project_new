@@ -1,3 +1,5 @@
+"""Запускается на ПК, отправляет коды управления на JETSON_IP + UDP_PORT"""
+
 import pygame
 import socket
 import logging
@@ -65,4 +67,5 @@ def main():
     pygame.quit()
 
 if __name__ == "__main__":
+
     main()

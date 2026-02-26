@@ -1,3 +1,5 @@
+"""Код для запуска машинки через ардуино напрямую с ПК"""
+
 import time
 import pygame
 import serial
@@ -217,4 +219,5 @@ if __name__ == "__main__":
     main()
     
     
+
     

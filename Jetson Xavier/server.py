@@ -3,6 +3,8 @@
    - Числовые команды: "скорость,поворот" (например "-1,-1")
    - Команды установки скорости: "speed:100,80" (установить скорость вперед=100, назад=80)
    - Буквенные команды: R (начать запись), C (остановить запись), Q (выход)
+   
+   Детекция конусов через YOLO на GPU
 """
 
 import socket
@@ -17,6 +19,9 @@ from datetime import datetime
 import cv2
 import pyzed.sl as sl
 import subprocess
+import numpy as np
+from ultralytics import YOLO
+import torch
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
 logger = logging.getLogger(__name__)
@@ -33,6 +38,20 @@ back_speed = 82
 base_rotation = 90
 right_rotation = 0
 left_rotation = 180
+
+# Цвета для конусов (BGR формат для OpenCV)
+CONE_COLORS = {
+    0: (0, 255, 255),   # Желтый
+    1: (0, 165, 255),   # Оранжевый
+    2: (255, 0, 0)      # Синий
+}
+
+# Названия классов для отображения
+CLASS_NAMES = {
+    0: "Yellow",
+    1: "Orange", 
+    2: "Blue"
+}
 
 def find_arduino_port():
     """Автоматически находит порт с Arduino"""
@@ -55,16 +74,81 @@ def find_arduino_port():
     logger.error("Arduino не найден")
     return None
 
-class VideoRecorder:
-    """Класс для управления записью ZED-камеры"""
+class ConeDetector:
+    """Класс для детекции конусов через YOLO"""
     
-    def __init__(self):
+    def __init__(self, model_path):
+        self.model = None
+        self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        
+        logger.info(f"Загрузка модели YOLO с {model_path}")
+        logger.info(f"Используется устройство: {self.device}")
+        
+        try:
+            self.model = YOLO(model_path)
+            if self.device == 'cuda':
+                self.model.to('cuda')
+                logger.info("✅ Модель загружена на GPU")
+            else:
+                logger.warning("⚠️ GPU не доступен, используется CPU")
+            
+            logger.info(f"Классы модели: {self.model.names}")
+        except Exception as e:
+            logger.error(f"Ошибка загрузки модели: {e}")
+            self.model = None
+    
+    def detect(self, frame):
+        """Детекция конусов на кадре"""
+        if self.model is None:
+            return frame, []
+        
+        try:
+            # Запускаем инференс
+            results = self.model(frame, verbose=False, half=(self.device=='cuda'))
+            
+            detections = []
+            for result in results:
+                for box in result.boxes:
+                    x1, y1, x2, y2 = map(int, box.xyxy[0])
+                    conf = float(box.conf[0])
+                    cls = int(box.cls[0])
+                    
+                    detections.append({
+                        'bbox': (x1, y1, x2, y2),
+                        'conf': conf,
+                        'class': cls,
+                        'center': ((x1 + x2) // 2, (y1 + y2) // 2)
+                    })
+                    
+                    # Рисуем bounding box с правильным цветом
+                    color = CONE_COLORS.get(cls, (0, 255, 0))
+                    cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+                    
+                    # Подпись класса с цветом
+                    class_name = CLASS_NAMES.get(cls, self.model.names[cls])
+                    cv2.putText(frame, f"{class_name} {conf:.2f}", (x1, y1-10),
+                              cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+                    
+                    # Центр конуса
+                    cv2.circle(frame, ((x1 + x2) // 2, (y1 + y2) // 2), 4, (255, 255, 255), -1)
+            
+            return frame, detections
+            
+        except Exception as e:
+            logger.error(f"Ошибка детекции: {e}")
+            return frame, []
+
+class VideoRecorder:
+    """Класс для управления записью ZED-камеры с детекцией конусов"""
+    
+    def __init__(self, detector):
         self.zed = None
         self.video_writer = None
         self.is_recording = False
         self.recording_thread = None
         self.stop_recording_flag = False
         self.output_folder = "zed_recordings"
+        self.detector = detector
         
         # Создаем папку для записей
         if not os.path.exists(self.output_folder):
@@ -95,18 +179,22 @@ class VideoRecorder:
             logger.warning("Запись уже идет")
             return False
         
-        logger.info("Запуск записи видео...")
+        logger.info("Запуск записи видео с детекцией конусов...")
         self.stop_recording_flag = False
         self.recording_thread = threading.Thread(target=self._recording_loop)
         self.recording_thread.start()
         return True
     
     def _recording_loop(self):
-        """Основной цикл записи"""
+        """Основной цикл записи с детекцией"""
         self.zed = sl.Camera()
         init_params = sl.InitParameters()
         init_params.camera_resolution = sl.RESOLUTION.HD720
         init_params.camera_fps = 30
+        init_params.depth_mode = sl.DEPTH_MODE.NEURAL
+        init_params.coordinate_units = sl.UNIT.METER
+        init_params.sdk_verbose = 0
+        init_params.sdk_gpu_id = 0
 
         if self.zed.open(init_params) != sl.ERROR_CODE.SUCCESS:
             logger.error("Не удалось инициализировать ZED-камеру")
@@ -120,10 +208,14 @@ class VideoRecorder:
 
         runtime_params = sl.RuntimeParameters()
         image_zed = sl.Mat()
+        depth_zed = sl.Mat()
         frame_count = 0
-        target_fps = 10
+        target_fps = 15
         frame_time = 1.0 / target_fps
         last_frame_time = time.time()
+        
+        # Для статистики детекции
+        detection_count = 0
 
         # Получаем первый кадр для инициализации
         if self.zed.grab(runtime_params) == sl.ERROR_CODE.SUCCESS:
@@ -150,17 +242,47 @@ class VideoRecorder:
                 
                 if current_time - last_frame_time >= frame_time:
                     if self.zed.grab(runtime_params) == sl.ERROR_CODE.SUCCESS:
+                        # Получаем изображение
                         self.zed.retrieve_image(image_zed, sl.VIEW.LEFT)
                         image_np = image_zed.get_data()
                         
                         if image_np.shape[2] == 4:
                             image_np = cv2.cvtColor(image_np, cv2.COLOR_BGRA2BGR)
+                        
+                        # Получаем глубину
+                        self.zed.retrieve_measure(depth_zed, sl.MEASURE.DEPTH)
+                        depth_data = depth_zed.get_data()
+                        
+                        # Детекция конусов
+                        image_np, detections = self.detector.detect(image_np)
+                        
+                        # Добавляем информацию о глубине для каждого конуса
+                        for det in detections:
+                            cx, cy = det['center']
+                            if 0 <= cy < depth_data.shape[0] and 0 <= cx < depth_data.shape[1]:
+                                depth = depth_data[cy, cx]
+                                if np.isfinite(depth) and depth > 0:
+                                    cv2.putText(image_np, f"{depth:.2f}m", 
+                                              (det['bbox'][0], det['bbox'][1]-25),
+                                              cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
+                        
+                        # Добавляем информацию о записи и количестве конусов
+                        if detections:
+                            detection_count += len(detections)
+                        
+                        # Отображаем информацию
+                        cv2.putText(image_np, f"REC: {frame_count}", (10, 30),
+                                  cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+                        
+                        cv2.putText(image_np, f"Cones: {len(detections)}", (10, 55),
+                                  cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
 
+                        # Записываем кадр
                         self.video_writer.write(image_np)
                         frame_count += 1
                         
-                        if frame_count % 30 == 0:  # Логируем каждые 30 кадров
-                            logger.debug(f"Записано кадров: {frame_count}")
+                        if frame_count % 30 == 0:
+                            logger.info(f"Записано кадров: {frame_count}, конусов в кадре: {len(detections)}")
                             
                         last_frame_time = current_time
                         
@@ -168,7 +290,7 @@ class VideoRecorder:
             if self.video_writer:
                 self.video_writer.release()
                 logger.info(f"Временное видео сохранено: {temp_video_path}")
-                logger.info(f"Всего кадров: {frame_count}")
+                logger.info(f"Всего кадров: {frame_count}, всего обнаружений: {detection_count}")
                 
                 # Конвертируем в совместимый формат
                 logger.info("Конвертация видео...")
@@ -210,7 +332,7 @@ class CarController:
         self.arduino = None
         try:
             self.arduino = serial.Serial(port, Baud, timeout=1)
-            time.sleep(2)  # Ждем инициализации Arduino
+            time.sleep(2)
             self.stop()
             time.sleep(0.5)
             logger.info(f"Arduino успешно подключен к {port}")
@@ -274,13 +396,23 @@ class CarController:
 def main():
     # Создаем UDP сокет
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    sock.settimeout(0.5)  # Таймаут для проверки остановки
-    sock.bind((UDP_IP, UDP_PORT))
-    logger.info(f"Сервер слушает порт {UDP_PORT}")
+    sock.settimeout(0.5)
+    
+    try:
+        sock.bind((UDP_IP, UDP_PORT))
+        logger.info(f"Сервер слушает порт {UDP_PORT}")
+    except OSError as e:
+        logger.error(f"Не удалось занять порт {UDP_PORT}: {e}")
+        logger.error("Убедитесь, что другой процесс не использует этот порт")
+        sys.exit(1)
+    
+    # Инициализируем детектор конусов
+    model_path = "/mnt/ArdorSSD/car_control_project_new/Datasets/cone_detector_v2.pt"
+    detector = ConeDetector(model_path)
     
     # Инициализируем контроллеры
     car = CarController()
-    recorder = VideoRecorder()
+    recorder = VideoRecorder(detector)
     
     last_command_time = time.time()
     running = True
@@ -288,7 +420,7 @@ def main():
     logger.info("Сервер готов к приему команд:")
     logger.info("  - Движение: 'скорость,поворот' (например '1,0' - вперед, '-1,-1' - назад+влево)")
     logger.info("  - Скорость: 'speed:100,80' - установить скорость вперед=100, назад=80")
-    logger.info("  - R - начать запись видео")
+    logger.info("  - R - начать запись видео (с детекцией конусов)")
     logger.info("  - C - остановить запись видео")
     logger.info("  - Q - выход из программы")
     logger.info(f"Текущая скорость: вперед={car.forward_speed}, назад={car.back_speed}")
@@ -325,7 +457,7 @@ def main():
                 elif command.startswith("speed:"):
                     # Команда установки скорости: speed:100,80
                     try:
-                        speed_str = command[6:]  # Убираем "speed:"
+                        speed_str = command[6:]
                         forward, back = map(int, speed_str.split(','))
                         car.set_speeds(forward, back)
                     except (ValueError, IndexError) as e:

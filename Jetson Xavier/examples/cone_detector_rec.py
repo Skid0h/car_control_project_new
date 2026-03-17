@@ -13,20 +13,57 @@ import sys
 
 # Инициализация pygame
 pygame.init()
-# Но лучше сделать видимое маленькое окно для фокуса
-pygame.display.set_mode((300, 100))
-pygame.display.set_caption("Управление записью - нажимайте R, C, Q")
+screen = pygame.display.set_mode((300, 130))
+pygame.display.set_caption("Управление записью")
 
-model = YOLO("/mnt/ArdorSSD/car_control_project_new/Datasets/cone_detector.pt")
+model = YOLO("/mnt/ArdorSSD/car_control_project_new/Datasets/cone_detector_v3.engine")
 
-class_colors = {
-    "Yellow": (0, 255, 255),
-    "Blue": (255, 0, 0),
-    "Orange": (0, 165, 255)
+# Параметры детекции
+CONFIDENCE_THRESHOLD = 0.4
+IOU_THRESHOLD = 0.4
+
+# Цвета для конусов
+CONE_COLORS = {
+    0: (0, 255, 255),   # Желтый
+    1: (0, 165, 255),   # Оранжевый
+    2: (255, 0, 0)      # Синий
 }
 
+CLASS_NAMES = {
+    0: "Yellow",
+    1: "Orange", 
+    2: "Blue"
+}
+
+# Класс для кнопок
+class Button:
+    def __init__(self, x, y, w, h, text, color, hover_color):
+        self.rect = pygame.Rect(x, y, w, h)
+        self.text = text
+        self.color = color
+        self.hover_color = hover_color
+        self.clicked = False
+        
+    def draw(self, screen, font):
+        mouse_pos = pygame.mouse.get_pos()
+        if self.rect.collidepoint(mouse_pos):
+            pygame.draw.rect(screen, self.hover_color, self.rect)
+        else:
+            pygame.draw.rect(screen, self.color, self.rect)
+        
+        pygame.draw.rect(screen, (255, 255, 255), self.rect, 2)
+        text_surface = font.render(self.text, True, (255, 255, 255))
+        text_rect = text_surface.get_rect(center=self.rect.center)
+        screen.blit(text_surface, text_rect)
+        
+    def handle_event(self, event):
+        if event.type == pygame.MOUSEBUTTONDOWN:
+            if self.rect.collidepoint(event.pos):
+                self.clicked = True
+                return True
+        return False
+
 def main():
-    # Создаем папку для записей
     output_folder = "zed_recordings"
     os.makedirs(output_folder, exist_ok=True)
 
@@ -42,35 +79,33 @@ def main():
         print("Ошибка инициализации ZED")
         return
 
-    print("\n" + "="*50)
-    print("УПРАВЛЕНИЕ (pygame окно):")
-    print("  R - начать запись")
-    print("  C - остановить запись")
-    print("  Q - выход")
-    print("="*50 + "\n")
-    print("  Нажимайте клавиши в окне 'Управление записью'")
-
-    # Переменные записи
     video_writer = None
     recording = False
     frame_count = 0
     temp_path = None
     final_path = None
-    
-    # Состояния клавиш
-    key_r_pressed = False
-    key_c_pressed = False
-    key_q_pressed = False
+    actual_fps = 0
 
     image_zed = sl.Mat()
     depth_zed = sl.Mat()
     
-    target_fps = 10
+    target_fps = 15
     frame_time = 1.0 / target_fps
     last_time = time.time()
-
-    # Для отображения статуса в pygame окне
-    font = pygame.font.Font(None, 36)
+    
+    # Для расчета FPS
+    fps_counter = 0
+    fps_last_time = time.time()
+    current_fps = 0
+    
+    # Создание кнопок
+    button_font = pygame.font.Font(None, 36)
+    btn_r = Button(20, 30, 80, 40, "R", (0, 100, 0), (0, 200, 0))
+    btn_c = Button(110, 30, 80, 40, "C", (100, 0, 0), (200, 0, 0))
+    btn_q = Button(200, 30, 80, 40, "Q", (100, 100, 100), (150, 150, 150))
+    
+    # Статус текст
+    font = pygame.font.Font(None, 28)
 
     try:
         while True:
@@ -79,74 +114,63 @@ def main():
             # Обработка событий pygame
             for event in pygame.event.get():
                 if event.type == pygame.QUIT:
-                    key_q_pressed = True
+                    pygame.quit()
+                    sys.exit()
                 
-                elif event.type == pygame.KEYDOWN:
-                    if event.key == pygame.K_r:
-                        key_r_pressed = True
-                        print(">>> R нажата (pygame)")
-                    elif event.key == pygame.K_c:
-                        key_c_pressed = True
-                        print(">>> C нажата (pygame)")
-                    elif event.key == pygame.K_q or event.key == pygame.K_ESCAPE:
-                        key_q_pressed = True
-                        print(">>> Q нажата (pygame)")
+                if btn_r.handle_event(event):
+                    if not recording:
+                        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                        temp_path = os.path.join(output_folder, f"temp_{timestamp}.avi")
+                        final_path = os.path.join(output_folder, f"recording_{timestamp}.mp4")
+                        
+                        height, width = 720, 1280
+                        fourcc = cv2.VideoWriter_fourcc(*'MJPG')
+                        
+                        actual_fps = current_fps if current_fps > 0 else 15
+                        video_writer = cv2.VideoWriter(temp_path, fourcc, actual_fps, (width, height))
+                        
+                        if video_writer.isOpened():
+                            recording = True
+                            frame_count = 0
+                            print(f"\n>>> ЗАПИСЬ: {final_path} с FPS {actual_fps}")
+                
+                if btn_c.handle_event(event):
+                    if recording:
+                        recording = False
+                        if video_writer:
+                            video_writer.release()
+                            print(f"\n>>> СТОП. Кадров: {frame_count}")
+                            
+                            try:
+                                subprocess.run([
+                                    'ffmpeg', '-i', temp_path,
+                                    '-c:v', 'libx264', '-preset', 'fast',
+                                    '-pix_fmt', 'yuv420p', '-y', final_path
+                                ], check=True, capture_output=True)
+                                os.remove(temp_path)
+                                print(f"Сохранено: {final_path}")
+                            except Exception as e:
+                                print(f"Ошибка конвертации: {e}")
+                                print(f"Временный файл: {temp_path}")
+                
+                if btn_q.handle_event(event):
+                    print("\nВыход...")
+                    pygame.quit()
+                    sys.exit()
             
             # Обновление pygame окна
-            screen = pygame.display.get_surface()
             screen.fill((30, 30, 30))
+            btn_r.draw(screen, button_font)
+            btn_c.draw(screen, button_font)
+            btn_q.draw(screen, button_font)
             
-            status_text = "REC" if recording else "STOP"
+            status_text = "RECORDING" if recording else "STOPPED"
             status_color = (255, 0, 0) if recording else (255, 255, 255)
-            
             text = font.render(f"Status: {status_text}", True, status_color)
-            screen.blit(text, (20, 20))
-            
-            text = font.render("R:Start C:Stop Q:Quit", True, (200, 200, 200))
-            screen.blit(text, (20, 60))
+            screen.blit(text, (20, 90))
             
             pygame.display.flip()
             
-            # Проверка команд
-            if key_q_pressed:
-                print("\nВыход...")
-                break
-            
-            if key_r_pressed and not recording:
-                key_r_pressed = False
-                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                temp_path = os.path.join(output_folder, f"temp_{timestamp}.avi")
-                final_path = os.path.join(output_folder, f"recording_{timestamp}.mp4")
-                
-                height, width = 720, 1280  # HD720
-                fourcc = cv2.VideoWriter_fourcc(*'MJPG')
-                video_writer = cv2.VideoWriter(temp_path, fourcc, target_fps, (width, height))
-                
-                if video_writer.isOpened():
-                    recording = True
-                    frame_count = 0
-                    print(f"\n>>> ЗАПИСЬ: {final_path}")
-            
-            if key_c_pressed and recording:
-                key_c_pressed = False
-                recording = False
-                if video_writer:
-                    video_writer.release()
-                    print(f"\n>>> СТОП. Кадров: {frame_count}")
-                    
-                    # Конвертация
-                    try:
-                        subprocess.run([
-                            'ffmpeg', '-i', temp_path,
-                            '-c:v', 'libx264', '-preset', 'fast',
-                            '-pix_fmt', 'yuv420p', '-y', final_path
-                        ], check=True, capture_output=True)
-                        os.remove(temp_path)
-                        print(f"Сохранено: {final_path}")
-                    except Exception as e:
-                        print(f"Ошибка конвертации: {e}")
-                        print(f"Временный файл: {temp_path}")
-
             if current_time - last_time >= frame_time:
                 if zed.grab(sl.RuntimeParameters()) == sl.ERROR_CODE.SUCCESS:
                     zed.retrieve_image(image_zed, sl.VIEW.LEFT)
@@ -155,18 +179,17 @@ def main():
                     frame = image_zed.get_data()[:, :, :3].copy()
                     depth_data = depth_zed.get_data()
 
-                    # YOLO детекция
-                    results = model(frame)
+                    results = model(frame, conf=CONFIDENCE_THRESHOLD, iou=IOU_THRESHOLD)
 
                     for result in results:
                         for box in result.boxes:
                             x1, y1, x2, y2 = map(int, box.xyxy[0])
                             conf = box.conf[0]
                             cls = int(box.cls[0])
-                            label = model.names[cls]
-                            color = class_colors.get(label, (0, 255, 0))
                             
-                            # Глубина
+                            color = CONE_COLORS.get(cls, (0, 255, 0))
+                            class_name = CLASS_NAMES.get(cls, model.names[cls])
+                            
                             center_x = (x1 + x2) // 2
                             center_y = (y1 + y2) // 2
                             depth_text = "N/A"
@@ -176,24 +199,29 @@ def main():
                                 if np.isfinite(depth_val) and depth_val > 0:
                                     depth_text = f"{depth_val:.2f}m"
                             
-                            # Отрисовка
                             cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
                             cv2.circle(frame, (center_x, center_y), 4, (255, 255, 255), -1)
-                            cv2.putText(frame, f"{label} {conf:.2f}", (x1, y1-25), 
+                            cv2.putText(frame, f"{class_name} {conf:.2f}", (x1, y1-25), 
                                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
                             cv2.putText(frame, f"Depth: {depth_text}", (x1, y1-10), 
                                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
 
-                    # Индикатор записи
+                    # Расчет FPS
+                    fps_counter += 1
+                    if current_time - fps_last_time >= 1.0:
+                        current_fps = fps_counter
+                        fps_counter = 0
+                        fps_last_time = current_time
+
+                    # Отображение FPS на видео
+                    cv2.putText(frame, f"FPS: {current_fps}", (10, 30), 
+                              cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+
                     if recording:
-                        cv2.circle(frame, (30, 30), 10, (0, 0, 255), -1)
-                        cv2.putText(frame, f"REC {frame_count}", (50, 40), 
+                        cv2.putText(frame, f"REC {frame_count}", (10, 55), 
                                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
                         video_writer.write(frame)
                         frame_count += 1
-
-                    cv2.putText(frame, "R=Start C=Stop Q=Exit (pygame)", (10, frame.shape[0]-20), 
-                              cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
 
                     cv2.imshow("ZED Cones Detection", frame)
                     cv2.waitKey(1)

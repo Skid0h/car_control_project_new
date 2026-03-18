@@ -7,5 +7,8 @@ https://disk.yandex.ru/d/yuhDvLEtMkLzKQ
 Датасет v3:
 https://disk.yandex.ru/d/sClGzNLgs0-sSQ
 
+Датасеты Yolo8, Yolo11, Yolo26:
+https://disk.yandex.ru/d/y6o3viAnsxHCWg
+
 Тест датасета v3 Yolo8
 https://disk.yandex.ru/d/1vtidZV4uAhzYg

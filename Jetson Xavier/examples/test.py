@@ -1,7 +1,11 @@
 """Запускается на Jetson, принимает команды управления с JETSON_IP + UDP_PORT
    Поддерживает:
    - Числовые команды: "скорость,поворот" (например "-1,-1")
+   - Команды установки скорости: "speed:100,80" (установить скорость вперед=100, назад=80)
    - Буквенные команды: R (начать запись), C (остановить запись), Q (выход)
+   - Авто-режим: A (включить), S (выключить)
+   
+   Детекция конусов через YOLO на GPU с .engine файлом
 """
 
 import socket
@@ -16,8 +20,11 @@ from datetime import datetime
 import cv2
 import pyzed.sl as sl
 import subprocess
+import numpy as np
+from ultralytics import YOLO
+import torch
 
-logging.basicConfig(level=logging.DEBUG, format='%(asctime)s [%(levelname)s] %(message)s')
+logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
 logger = logging.getLogger(__name__)
 
 UDP_IP = "192.168.137.50"
@@ -30,8 +37,26 @@ forward_speed = 98
 back_speed = 82
 
 base_rotation = 90
-right_rotation = 30
-left_rotation = 150
+right_rotation = 0
+left_rotation = 180
+
+# Параметры детекции
+CONFIDENCE_THRESHOLD = 0.4
+IOU_THRESHOLD = 0.4
+
+# Цвета для конусов (BGR формат для OpenCV)
+CONE_COLORS = {
+    0: (0, 255, 255),   # Желтый
+    1: (0, 165, 255),   # Оранжевый
+    2: (255, 0, 0)      # Синий
+}
+
+# Названия классов для отображения
+CLASS_NAMES = {
+    0: "Yellow",
+    1: "Orange", 
+    2: "Blue"
+}
 
 def find_arduino_port():
     """Автоматически находит порт с Arduino"""
@@ -54,16 +79,101 @@ def find_arduino_port():
     logger.error("Arduino не найден")
     return None
 
-class VideoRecorder:
-    """Класс для управления записью ZED-камеры"""
+class ConeDetector:
+    """Класс для детекции конусов через YOLO с .engine файлом"""
     
-    def __init__(self):
+    def __init__(self, model_path):
+        self.model = None
+        self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        
+        logger.info(f"Загрузка модели YOLO с {model_path}")
+        logger.info(f"Используется устройство: {self.device}")
+        
+        try:
+            # Загружаем модель без указания device
+            self.model = YOLO(model_path)
+            
+            # Для TensorRT (.engine) не нужно вызывать .to('cuda')
+            # Модель автоматически использует GPU если доступен
+            if self.device == 'cuda':
+                logger.info("✅ TensorRT модель загружена для GPU")
+            else:
+                logger.warning("⚠️ GPU не доступен, используется CPU")
+            
+            # Проверяем классы модели
+            if hasattr(self.model, 'names'):
+                logger.info(f"Классы модели: {self.model.names}")
+            else:
+                logger.info("Классы модели не определены, используем стандартные")
+                
+        except Exception as e:
+            logger.error(f"Ошибка загрузки модели: {e}")
+            self.model = None
+    
+    def detect(self, frame):
+        """Детекция конусов на кадре с использованием параметров CONFIDENCE_THRESHOLD и IOU_THRESHOLD"""
+        if self.model is None:
+            return frame, []
+        
+        try:
+            # Для TensorRT моделей передаем device в аргументах predict
+            results = self.model(
+                frame, 
+                conf=CONFIDENCE_THRESHOLD, 
+                iou=IOU_THRESHOLD,
+                verbose=False,
+                device=self.device  # Передаем устройство здесь
+            )
+            
+            detections = []
+            for result in results:
+                if result.boxes is not None:
+                    for box in result.boxes:
+                        x1, y1, x2, y2 = map(int, box.xyxy[0])
+                        conf = float(box.conf[0])
+                        cls = int(box.cls[0])
+                        
+                        detections.append({
+                            'bbox': (x1, y1, x2, y2),
+                            'conf': conf,
+                            'class': cls,
+                            'center': ((x1 + x2) // 2, (y1 + y2) // 2)
+                        })
+                        
+                        # Рисуем bounding box с правильным цветом
+                        color = CONE_COLORS.get(cls, (0, 255, 0))
+                        cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+                        
+                        # Подпись класса с цветом
+                        class_name = CLASS_NAMES.get(cls, f"Class_{cls}")
+                        cv2.putText(frame, f"{class_name} {conf:.2f}", (x1, y1-10),
+                                  cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+                        
+                        # Центр конуса
+                        cv2.circle(frame, ((x1 + x2) // 2, (y1 + y2) // 2), 4, (255, 255, 255), -1)
+            
+            return frame, detections
+            
+        except Exception as e:
+            logger.error(f"Ошибка детекции: {e}")
+            return frame, []
+
+class VideoRecorder:
+    """Класс для управления записью ZED-камеры с детекцией конусов"""
+    
+    def __init__(self, detector):
         self.zed = None
         self.video_writer = None
         self.is_recording = False
         self.recording_thread = None
         self.stop_recording_flag = False
         self.output_folder = "zed_recordings"
+        self.detector = detector
+        
+        # Параметры для FPS
+        self.current_fps = 0
+        self.target_fps = 15
+        self.frame_time = 1.0 / self.target_fps
         
         # Создаем папку для записей
         if not os.path.exists(self.output_folder):
@@ -94,18 +204,22 @@ class VideoRecorder:
             logger.warning("Запись уже идет")
             return False
         
-        logger.info("Запуск записи видео...")
+        logger.info("Запуск записи видео с детекцией конусов...")
         self.stop_recording_flag = False
         self.recording_thread = threading.Thread(target=self._recording_loop)
         self.recording_thread.start()
         return True
     
     def _recording_loop(self):
-        """Основной цикл записи"""
+        """Основной цикл записи с детекцией"""
         self.zed = sl.Camera()
         init_params = sl.InitParameters()
         init_params.camera_resolution = sl.RESOLUTION.HD720
         init_params.camera_fps = 30
+        init_params.depth_mode = sl.DEPTH_MODE.PERFORMANCE
+        init_params.coordinate_units = sl.UNIT.METER
+        init_params.sdk_verbose = 0
+        init_params.sdk_gpu_id = 0
 
         if self.zed.open(init_params) != sl.ERROR_CODE.SUCCESS:
             logger.error("Не удалось инициализировать ZED-камеру")
@@ -119,9 +233,14 @@ class VideoRecorder:
 
         runtime_params = sl.RuntimeParameters()
         image_zed = sl.Mat()
+        depth_zed = sl.Mat()
         frame_count = 0
-        target_fps = 10
-        frame_time = 1.0 / target_fps
+        
+        # Для расчета FPS
+        fps_counter = 0
+        fps_last_time = time.time()
+        current_fps = 0
+        
         last_frame_time = time.time()
 
         # Получаем первый кадр для инициализации
@@ -134,7 +253,10 @@ class VideoRecorder:
             
             height, width = image_np.shape[:2]
             fourcc = cv2.VideoWriter_fourcc(*'MJPG')
-            self.video_writer = cv2.VideoWriter(temp_video_path, fourcc, target_fps, (width, height))
+            
+            # Используем текущий FPS для записи
+            actual_fps = current_fps if current_fps > 0 else self.target_fps
+            self.video_writer = cv2.VideoWriter(temp_video_path, fourcc, actual_fps, (width, height))
             
             if not self.video_writer.isOpened():
                 logger.error("Не удалось открыть VideoWriter")
@@ -147,19 +269,54 @@ class VideoRecorder:
             while not self.stop_recording_flag:
                 current_time = time.time()
                 
-                if current_time - last_frame_time >= frame_time:
+                if current_time - last_frame_time >= self.frame_time:
                     if self.zed.grab(runtime_params) == sl.ERROR_CODE.SUCCESS:
+                        # Получаем изображение
                         self.zed.retrieve_image(image_zed, sl.VIEW.LEFT)
                         image_np = image_zed.get_data()
                         
                         if image_np.shape[2] == 4:
                             image_np = cv2.cvtColor(image_np, cv2.COLOR_BGRA2BGR)
+                        
+                        # Получаем глубину
+                        self.zed.retrieve_measure(depth_zed, sl.MEASURE.DEPTH)
+                        depth_data = depth_zed.get_data()
+                        
+                        # Детекция конусов
+                        image_np, detections = self.detector.detect(image_np)
+                        
+                        # Добавляем информацию о глубине для каждого конуса
+                        for det in detections:
+                            cx, cy = det['center']
+                            if 0 <= cy < depth_data.shape[0] and 0 <= cx < depth_data.shape[1]:
+                                depth = depth_data[cy, cx]
+                                if np.isfinite(depth) and depth > 0:
+                                    cv2.putText(image_np, f"{depth:.2f}m", 
+                                              (det['bbox'][0], det['bbox'][1]-25),
+                                              cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
+                        
+                        # Расчет FPS
+                        fps_counter += 1
+                        if current_time - fps_last_time >= 1.0:
+                            current_fps = fps_counter
+                            fps_counter = 0
+                            fps_last_time = current_time
+                        
+                        # Отображение FPS на видео
+                        cv2.putText(image_np, f"FPS: {current_fps}", (10, 30), 
+                                  cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                        
+                        # Добавляем информацию о записи и количестве конусов
+                        if self.is_recording:
+                            cv2.putText(image_np, f"REC: {frame_count}", (10, 55),
+                                      cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
 
+                        # Записываем кадр
                         self.video_writer.write(image_np)
                         frame_count += 1
                         
-                        if frame_count % 30 == 0:  # Логируем каждые 30 кадров
-                            logger.debug(f"Записано кадров: {frame_count}")
+                        if frame_count % 30 == 0:
+                            logger.info(f"Записано кадров: {frame_count}, конусов в кадре: {len(detections)}")
                             
                         last_frame_time = current_time
                         
@@ -195,6 +352,11 @@ class VideoRecorder:
 
 class CarController:
     def __init__(self):
+        self.forward_speed = forward_speed
+        self.back_speed = back_speed
+        self.arduino = None
+        self.last_command_time = 0
+        
         port = find_arduino_port()
         if port is None:
             logger.error("Arduino не найден, управление движением недоступно")
@@ -204,13 +366,19 @@ class CarController:
         self.arduino = None
         try:
             self.arduino = serial.Serial(port, Baud, timeout=1)
-            time.sleep(2)  # Ждем инициализации Arduino
+            time.sleep(2)
             self.stop()
             time.sleep(0.5)
             logger.info(f"Arduino успешно подключен к {port}")
         except Exception as e:
             logger.error(f"Ошибка подключения к {port}: {e}")
             self.arduino = None
+    
+    def set_speeds(self, forward, back):
+        """Установка новых значений скорости"""
+        self.forward_speed = forward
+        self.back_speed = back
+        logger.info(f"Скорость установлена: вперед={forward}, назад={back}")
     
     def update(self, speed, steering):
         if not self.arduino:
@@ -219,9 +387,9 @@ class CarController:
 
         motor_value = base_speed
         if speed > 0:
-            motor_value = forward_speed
+            motor_value = self.forward_speed
         elif speed < 0:
-            motor_value = back_speed
+            motor_value = self.back_speed
         
         steer_value = base_rotation
         if steering < 0:
@@ -232,6 +400,7 @@ class CarController:
         command = f"{motor_value},{steer_value}\n"
         try:
             self.arduino.write(command.encode('utf-8'))
+            self.last_command_time = time.time()
             logger.debug(f"Команда движения: {command.strip()}")
         except serial.SerialException as e:
             logger.error(f"Ошибка отправки: {e}")
@@ -241,9 +410,15 @@ class CarController:
         if self.arduino:
             try:
                 self.arduino.write("90,90\n".encode('utf-8'))
+                self.last_command_time = time.time()
                 logger.debug("Команда: СТОП")
             except:
                 pass
+    
+    def check_stop(self):
+        """Проверка и остановка если давно не было команд"""
+        if self.arduino and time.time() - self.last_command_time > 1.0:
+            self.stop()
     
     def close(self):
         self.stop()
@@ -252,25 +427,155 @@ class CarController:
             self.arduino.close()
         logger.info("Arduino отключен")
 
+class AutoMode:
+    """Класс для управления авто-режимом"""
+    
+    def __init__(self, car_controller, detector):
+        self.car = car_controller
+        self.detector = detector
+        self.active = False
+        self.thread = None
+        self.stop_flag = False
+        self.orange_detected = False
+    
+    def start(self):
+        """Запуск авто-режима"""
+        if self.active:
+            logger.warning("Авто-режим уже активен")
+            return False
+        
+        logger.info("🚗 ЗАПУСК АВТО-РЕЖИМА")
+        self.active = True
+        self.stop_flag = False
+        self.orange_detected = False
+        self.thread = threading.Thread(target=self._auto_mode_loop)
+        self.thread.start()
+        return True
+    
+    def stop(self):
+        """Остановка авто-режима"""
+        if not self.active:
+            return
+        
+        logger.info("🛑 ОСТАНОВКА АВТО-РЕЖИМА")
+        self.stop_flag = True
+        if self.thread:
+            self.thread.join(timeout=2.0)
+        self.active = False
+    
+    def _auto_mode_loop(self):
+        """Основной цикл авто-режима"""
+        # Шаг 1: Остановка и выравнивание колес
+        logger.info("Авто-режим: установка базового положения")
+        self.car.update(0, 0)  # Остановка, колеса прямо
+        time.sleep(1.0)
+        
+        # Шаг 2: Движение вперед
+        logger.info("Авто-режим: движение вперед со скоростью 98")
+        self.car.update(1, 0)  # Движение прямо
+        
+        # Мониторинг конусов
+        check_interval = 0.1
+        last_check_time = time.time()
+        
+        # Получаем доступ к камере для мониторинга конусов
+        zed = sl.Camera()
+        init_params = sl.InitParameters()
+        init_params.camera_resolution = sl.RESOLUTION.HD720
+        init_params.camera_fps = 30
+        init_params.depth_mode = sl.DEPTH_MODE.PERFORMANCE
+        init_params.coordinate_units = sl.UNIT.METER
+        
+        if zed.open(init_params) != sl.ERROR_CODE.SUCCESS:
+            logger.error("Не удалось открыть камеру для авто-режима")
+            self.car.update(0, 0)
+            self.active = False
+            return
+        
+        runtime_params = sl.RuntimeParameters()
+        image_zed = sl.Mat()
+        depth_zed = sl.Mat()
+        
+        try:
+            while not self.stop_flag:
+                current_time = time.time()
+                
+                if current_time - last_check_time >= check_interval:
+                    if zed.grab(runtime_params) == sl.ERROR_CODE.SUCCESS:
+                        zed.retrieve_image(image_zed, sl.VIEW.LEFT)
+                        image_np = image_zed.get_data()
+                        
+                        if image_np.shape[2] == 4:
+                            image_np = cv2.cvtColor(image_np, cv2.COLOR_BGRA2BGR)
+                        
+                        zed.retrieve_measure(depth_zed, sl.MEASURE.DEPTH)
+                        depth_data = depth_zed.get_data()
+                        
+                        # Детекция конусов
+                        _, detections = self.detector.detect(image_np)
+                        
+                        # Проверяем оранжевые конусы на расстоянии <= 0.4м
+                        for det in detections:
+                            if det['class'] == 1:  # Оранжевый конус
+                                cx, cy = det['center']
+                                if 0 <= cy < depth_data.shape[0] and 0 <= cx < depth_data.shape[1]:
+                                    depth = depth_data[cy, cx]
+                                    if np.isfinite(depth) and depth > 0 and depth <= 0.4:
+                                        logger.info(f"⚠️ ОБНАРУЖЕН ОРАНЖЕВЫЙ КОНУС на расстоянии {depth:.2f}м!")
+                                        self.orange_detected = True
+                                        self.stop_flag = True
+                                        break
+                        
+                        last_check_time = current_time
+                
+                time.sleep(check_interval)
+                
+        finally:
+            zed.close()
+        
+        # Остановка движения
+        logger.info("Авто-режим: остановка")
+        self.car.update(0, 0)
+        time.sleep(0.5)
+        
+        logger.info("✅ Авто-режим завершен")
+        self.active = False
+
 def main():
     # Создаем UDP сокет
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    sock.settimeout(0.5)  # Таймаут для проверки остановки
-    sock.bind((UDP_IP, UDP_PORT))
-    logger.info(f"Сервер слушает порт {UDP_PORT}")
+    sock.settimeout(0.5)
+    
+    try:
+        sock.bind((UDP_IP, UDP_PORT))
+        logger.info(f"Сервер слушает порт {UDP_PORT}")
+    except OSError as e:
+        logger.error(f"Не удалось занять порт {UDP_PORT}: {e}")
+        logger.error("Убедитесь, что другой процесс не использует этот порт")
+        sys.exit(1)
+    
+    # Инициализируем детектор конусов с .engine файлом
+    model_path = "/mnt/ArdorSSD/car_control_project_new/Datasets/cone_detector_v3.engine"
+    detector = ConeDetector(model_path)
     
     # Инициализируем контроллеры
     car = CarController()
-    recorder = VideoRecorder()
+    recorder = VideoRecorder(detector)
+    auto_mode = AutoMode(car, detector)
     
     last_command_time = time.time()
     running = True
     
     logger.info("Сервер готов к приему команд:")
-    logger.info("  - Числовые: 'скорость,поворот' (например '-1,-1')")
-    logger.info("  - R - начать запись видео")
+    logger.info("  - Движение: 'скорость,поворот' (например '1,0' - вперед, '-1,-1' - назад+влево)")
+    logger.info("  - Скорость: 'speed:100,80' - установить скорость вперед=100, назад=80")
+    logger.info("  - R - начать запись видео (с детекцией конусов)")
     logger.info("  - C - остановить запись видео")
+    logger.info("  - A - включить авто-режим (движение до оранжевого конуса)")
+    logger.info("  - S - выключить авто-режим (вернуться в ручной)")
     logger.info("  - Q - выход из программы")
+    logger.info(f"Текущая скорость: вперед={car.forward_speed}, назад={car.back_speed}")
+    logger.info(f"Параметры детекции: confidence={CONFIDENCE_THRESHOLD}, iou={IOU_THRESHOLD}")
     
     try:
         while running:
@@ -286,13 +591,34 @@ def main():
                     logger.info("Получена команда Q - выход")
                     running = False
                     break
+                
+                elif command == "A":
+                    logger.info("Получена команда A - включить авто-режим")
+                    if not auto_mode.active:
+                        # Если идет запись, останавливаем
+                        if recorder.is_recording:
+                            logger.info("Остановка записи перед авто-режимом")
+                            recorder.stop_recording()
+                        auto_mode.start()
+                    else:
+                        logger.info("Авто-режим уже активен")
+                
+                elif command == "S":
+                    logger.info("Получена команда S - выключить авто-режим")
+                    if auto_mode.active:
+                        auto_mode.stop()
+                    else:
+                        logger.info("Авто-режим не активен")
                     
                 elif command == "R":
                     logger.info("Получена команда R - начать запись")
-                    if not recorder.is_recording:
-                        recorder.start_recording()
+                    if not auto_mode.active:  # Запись только в ручном режиме
+                        if not recorder.is_recording:
+                            recorder.start_recording()
+                        else:
+                            logger.info("Запись уже идет")
                     else:
-                        logger.info("Запись уже идет")
+                        logger.info("Запись недоступна в авто-режиме")
                         
                 elif command == "C":
                     logger.info("Получена команда C - остановить запись")
@@ -300,24 +626,51 @@ def main():
                         recorder.stop_recording()
                     else:
                         logger.info("Нет активной записи")
+                
+                elif command.startswith("speed:"):
+                    # Команда установки скорости: speed:100,80
+                    try:
+                        speed_str = command[6:]
+                        forward, back = map(int, speed_str.split(','))
+                        car.set_speeds(forward, back)
+                    except (ValueError, IndexError) as e:
+                        logger.error(f"Ошибка парсинга команды скорости: {e}")
+                
+                elif command == "0,0":
+                    # Команда остановки
+                    if not auto_mode.active:
+                        car.update(0, 0)
+                    else:
+                        logger.debug("Команда движения игнорируется в авто-режиме")
                         
                 else:
                     # Пытаемся распарсить как команду движения (speed,steering)
-                    try:
-                        speed, steering = map(int, command.split(','))
-                        car.update(speed, steering)
-                        logger.debug(f"Движение: скорость={speed}, поворот={steering}")
-                    except ValueError:
-                        logger.warning(f"Неизвестная команда: {command}")
+                    if not auto_mode.active:
+                        try:
+                            speed, steering = map(int, command.split(','))
+                            car.update(speed, steering)
+                            logger.debug(f"Движение: скорость={speed}, поворот={steering}")
+                        except ValueError:
+                            logger.warning(f"Неизвестная команда: {command}")
+                    else:
+                        logger.debug(f"Команда движения '{command}' игнорируется в авто-режиме")
                     
             except socket.timeout:
                 # Проверяем, не пора ли остановить машину
-                if time.time() - last_command_time > 1.0:
-                    car.stop()
+                car.check_stop()
+                
+                # Автоматическое переключение в ручной режим после завершения авто-режима
+                if auto_mode.active and not auto_mode.active:
+                    logger.info("Авто-режим завершен, автоматическое переключение в ручной режим")
                     
     except KeyboardInterrupt:
         logger.info("Остановка сервера...")
     finally:
+        # Останавливаем авто-режим если активен
+        if auto_mode.active:
+            logger.info("Остановка авто-режима перед выходом...")
+            auto_mode.stop()
+        
         # Останавливаем запись если она идет
         if recorder.is_recording:
             logger.info("Остановка записи перед выходом...")

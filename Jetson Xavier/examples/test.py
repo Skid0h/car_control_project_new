@@ -1,7 +1,6 @@
 """Запускается на Jetson.
   Слушает все интерфейсы (0.0.0.0) на порту UDP_PORT.
-  Возвращает телеметрию клиенту для двусторонней связи.
-  Исправлена проблема ускоренного видео и заблокирован FPS на 15.
+  Включена 3D-навигация (Pure Pursuit) и плавное рулевое управление.
 """
 
 import socket
@@ -13,6 +12,7 @@ import threading
 import sys
 import os
 import json
+import math
 from datetime import datetime
 import cv2
 import pyzed.sl as sl
@@ -24,7 +24,6 @@ import torch
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
 logger = logging.getLogger(__name__)
 
-# Слушаем ВСЕ сетевые интерфейсы, чтобы избежать ошибок биндинга
 UDP_IP = "0.0.0.0" 
 UDP_PORT = 5005
 Baud = 9600
@@ -40,7 +39,7 @@ left_rotation = 180
 # Параметры детекции
 CONFIDENCE_THRESHOLD = 0.4
 IOU_THRESHOLD = 0.4
-ORANGE_CONE_CLASS_ID = 1  # ID класса оранжевого конуса в YOLO
+ORANGE_CONE_CLASS_ID = 1
 
 CONE_COLORS = {
    0: (0, 255, 255),   # Желтый
@@ -118,9 +117,8 @@ class VisionSystem:
        self.running = True
        self.output_folder = "zed_recordings"
        
-       # ЖЕСТКАЯ ФИКСАЦИЯ FPS
        self.target_fps = 15.0 
-       self.frame_time = 1.0 / self.target_fps  # Должно быть ~0.0666 сек на кадр
+       self.frame_time = 1.0 / self.target_fps
        
        if not os.path.exists(self.output_folder):
            os.makedirs(self.output_folder)
@@ -130,7 +128,6 @@ class VisionSystem:
        
    def _convert_video(self, input_path, output_path):
        try:
-           # Указываем ffmpeg сохранять исходный фреймрейт с ключом -r
            cmd = ['ffmpeg', '-i', input_path, '-r', str(self.target_fps), '-c:v', 'libx264', '-preset', 'fast', '-crf', '23', '-pix_fmt', 'yuv420p', '-y', output_path]
            subprocess.run(cmd, check=True, capture_output=True)
            logger.info(f"Видео сконвертировано: {output_path}")
@@ -141,15 +138,18 @@ class VisionSystem:
    def _vision_loop(self):
        init_params = sl.InitParameters()
        init_params.camera_resolution = sl.RESOLUTION.HD720
-       # Ограничиваем саму ZED камеру, чтобы она не пыталась отдавать лишние кадры
        init_params.camera_fps = int(self.target_fps) 
        init_params.depth_mode = sl.DEPTH_MODE.PERFORMANCE
-       init_params.coordinate_units = sl.UNIT.METER
+       init_params.coordinate_units = sl.UNIT.METER 
        
        if self.zed.open(init_params) != sl.ERROR_CODE.SUCCESS:
-           logger.error("Не удалось открыть ZED-камеру. Автономный режим недоступен.")
+           logger.error("Не удалось открыть ZED-камеру.")
            self.running = False
            return
+
+       cam_info = self.zed.get_camera_information()
+       fx = cam_info.camera_configuration.calibration_parameters.left_cam.fx
+       cx_cam = cam_info.camera_configuration.calibration_parameters.left_cam.cx
 
        runtime_params = sl.RuntimeParameters()
        image_zed = sl.Mat()
@@ -163,10 +163,10 @@ class VisionSystem:
        temp_video_path = None
        final_video_path = None
 
-       logger.info(f"Система зрения запущена. FPS строго заблокирован на {self.target_fps}")
+       logger.info("Система зрения запущена.")
 
        while self.running:
-           loop_start_time = time.time() # Засекаем время старта обработки кадра
+           loop_start_time = time.time()
            
            if self.zed.grab(runtime_params) == sl.ERROR_CODE.SUCCESS:
                self.zed.retrieve_image(image_zed, sl.VIEW.LEFT)
@@ -179,29 +179,83 @@ class VisionSystem:
                
                image_np, detections = self.detector.detect(image_np)
                
+               blue_cones_3d = []
+               yellow_cones_3d = []
                target_detected = False
+               
                for det in detections:
-                   cx, cy = det['center']
-                   if 0 <= cy < depth_data.shape[0] and 0 <= cx < depth_data.shape[1]:
-                       depth = depth_data[cy, cx]
-                       if np.isfinite(depth) and depth > 0:
-                           cv2.putText(image_np, f"{depth:.2f}m", (det['bbox'][0], det['bbox'][1]-25), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
+                   u, v = det['center']
+                   if 0 <= v < depth_data.shape[0] and 0 <= u < depth_data.shape[1]:
+                       z = depth_data[v, u] 
+                       if np.isfinite(z) and z > 0:
+                           x = (u - cx_cam) * z / fx
+                           det['pos_3d'] = (x, z)
+                           cv2.putText(image_np, f"X:{x:.2f} Z:{z:.2f}", (det['bbox'][0], det['bbox'][1]-25), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
                            
-                           # Проверяем на оранжевый конус
-                           if det['class'] == ORANGE_CONE_CLASS_ID and depth <= 0.4:
+                           if det['class'] == 2:   # Blue (слева)
+                               blue_cones_3d.append(det)
+                           elif det['class'] == 0: # Yellow (справа)
+                               yellow_cones_3d.append(det)
+                           elif det['class'] == 1 and z <= 0.4: # Orange stop
                                target_detected = True
 
-               # --- ЛОГИКА АВТОМАТИЧЕСКОГО РЕЖИМА ---
+               # --- РАСЧЕТ УПРАВЛЕНИЯ (PURE PURSUIT) ---
+               gate_x = None
+               gate_z = None
+               auto_steering = 0.0 # По умолчанию едем прямо
+               
+               # Сценарий 1: Видим оба конуса (Идеально)
+               if blue_cones_3d and yellow_cones_3d:
+                   closest_blue = min(blue_cones_3d, key=lambda c: c['pos_3d'][1])
+                   closest_yellow = min(yellow_cones_3d, key=lambda c: c['pos_3d'][1])
+                   
+                   gate_x = (closest_blue['pos_3d'][0] + closest_yellow['pos_3d'][0]) / 2.0
+                   gate_z = (closest_blue['pos_3d'][1] + closest_yellow['pos_3d'][1]) / 2.0
+                   
+                   gate_u = int((gate_x * fx / gate_z) + cx_cam)
+                   gate_v = int((closest_blue['center'][1] + closest_yellow['center'][1]) / 2)
+                   cv2.circle(image_np, (gate_u, gate_v), 8, (0, 255, 0), -1)
+               
+               # Сценарий 2: Видим только синий конус
+               elif blue_cones_3d:
+                   closest_blue = min(blue_cones_3d, key=lambda c: c['pos_3d'][1])
+                   gate_x = closest_blue['pos_3d'][0] + 1.0 # Центр трассы = 1 метр правее синего
+                   gate_z = closest_blue['pos_3d'][1]
+                   
+               # Сценарий 3: Видим только желтый конус
+               elif yellow_cones_3d:
+                   closest_yellow = min(yellow_cones_3d, key=lambda c: c['pos_3d'][1])
+                   gate_x = closest_yellow['pos_3d'][0] - 1.0 # Центр трассы = 1 метр левее желтого
+                   gate_z = closest_yellow['pos_3d'][1]
+
+               # Если мы вычислили целевую точку, переводим ее в угол руля
+               if gate_x is not None and gate_z is not None:
+                   # Угол к цели в радианах (от -pi до pi)
+                   alpha = math.atan2(gate_x, gate_z)
+                   
+                   # П-регулятор: Коэффициент чувствительности руля
+                   Kp = 1.5 
+                   
+                   auto_steering = alpha * Kp
+                   # Жестко ограничиваем команды пределами [-1.0, 1.0]
+                   auto_steering = max(-1.0, min(1.0, auto_steering))
+                   
+                   if frame_count % 15 == 0:
+                       logger.info(f"📍 Цель: X={gate_x:.2f}m, Угол={math.degrees(alpha):.1f}°, Руль={auto_steering:.2f}")
+
+
+               # --- ПРИМЕНЕНИЕ КОМАНД В АВТОМАТИЧЕСКОМ РЕЖИМЕ ---
                if self.robot_state.get('auto_mode', False):
                    if target_detected:
-                       logger.info("Оранжевый конус на дистанции <= 0.4м! Возврат в РУЧНОЙ режим.")
+                       logger.info("Оранжевый конус! АВТОПИЛОТ ОСТАНОВЛЕН.")
                        self.robot_state['auto_mode'] = False
                        self.robot_state['msg'] = "ОРАНЖЕВЫЙ КОНУС! АВТОПИЛОТ ОСТАНОВЛЕН."
                        self.robot_state['msg_time'] = time.time()
                        self.car.stop()
                    else:
-                       self.car.update(1, 0) # Движение прямо
-               # -------------------------------------
+                       # Едем вперед (1) с вычисленным плавным углом поворота руля
+                       self.car.update(1, auto_steering)
+               # ------------------------------------------------
 
                fps_counter += 1
                if time.time() - fps_last_time >= 1.0:
@@ -209,21 +263,16 @@ class VisionSystem:
                    fps_counter = 0
                    fps_last_time = time.time()
                
-               # Выводим реальный FPS для контроля (должен стабильно держаться около 15)
                cv2.putText(image_np, f"FPS: {current_fps} Mode: {'AUTO' if self.robot_state.get('auto_mode') else 'MANUAL'}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
                
                if self.is_recording:
                    cv2.putText(image_np, f"REC: {frame_count}", (10, 55), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
-                   
                    if self.video_writer is None:
                        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
                        temp_video_path = os.path.join(self.output_folder, f"temp_{timestamp}.avi")
                        final_video_path = os.path.join(self.output_folder, f"zed_recording_{timestamp}.mp4")
                        height, width = image_np.shape[:2]
                        fourcc = cv2.VideoWriter_fourcc(*'MJPG')
-                       
-                       # РЕШЕНИЕ ПРОБЛЕМЫ УСКОРЕНИЯ:
-                       # Жестко указываем self.target_fps (15.0), игнорируем любые скачки current_fps
                        self.video_writer = cv2.VideoWriter(temp_video_path, fourcc, float(self.target_fps), (width, height))
                        frame_count = 0
                        
@@ -235,11 +284,8 @@ class VisionSystem:
                        self.video_writer = None
                        threading.Thread(target=self._convert_video, args=(temp_video_path, final_video_path)).start()
            
-           # --- ПРОГРАММНЫЙ БЛОКИРАТОР ВРЕМЕНИ (Стабилизация FPS) ---
            processing_time = time.time() - loop_start_time
            if processing_time < self.frame_time:
-               # Если Jetson справился с кадром быстрее, чем за 0.066 сек, мы усыпляем поток на оставшееся время.
-               # Это гарантирует, что следующий кадр начнет обрабатываться ровно вовремя.
                time.sleep(self.frame_time - processing_time)
 
        if self.video_writer:
@@ -248,17 +294,15 @@ class VisionSystem:
 
    def start_recording(self):
        self.is_recording = True
-
    def stop_recording(self):
        self.is_recording = False
-
    def close(self):
        self.running = False
        self.thread.join(timeout=5.0)
 
 class CarController:
    def __init__(self):
-       self.lock = threading.Lock() # Блокировка для защиты Serial-порта
+       self.lock = threading.Lock()
        self.forward_speed = forward_speed
        self.back_speed = back_speed
        self.last_command_time = 0
@@ -286,22 +330,29 @@ class CarController:
        self.back_speed = back
    
    def update(self, speed, steering):
+       """
+       speed: -1 (назад), 0 (стоп), 1 (вперед)
+       steering: float от -1.0 (максимально влево) до 1.0 (максимально вправо)
+       """
        if not self.arduino: return
        
        motor_value = base_speed
        if speed > 0: motor_value = self.forward_speed
        elif speed < 0: motor_value = self.back_speed
        
-       steer_value = base_rotation
-       if steering < 0: steer_value = left_rotation
-       elif steering > 0: steer_value = right_rotation
+       # Ограничиваем входящее значение от -1.0 до 1.0 для безопасности
+       steering_clamped = max(-1.0, min(1.0, float(steering)))
+       
+       # Переводим дробное значение в градусы для сервопривода
+       steer_value = int(base_rotation - (steering_clamped * 90))
+       steer_value = max(0, min(180, steer_value))
        
        command = f"{motor_value},{steer_value}\n"
        
        current_time = time.time()
-       # В авто-режиме шлем не чаще 10 раз в секунду, чтобы не забить буфер
+       # В авто-режиме шлем не чаще 10 раз в секунду
        if command != self.last_sent_cmd or (current_time - self.last_sent_time) > 0.1:
-           with self.lock: # Защищаем доступ к порту
+           with self.lock:
                try:
                    self.arduino.write(command.encode('utf-8'))
                    self.last_sent_cmd = command
@@ -315,8 +366,8 @@ class CarController:
        if not self.arduino: return
        with self.lock:
            try:
-               self.arduino.write("90,90\n".encode('utf-8'))
-               self.last_sent_cmd = "90,90\n"
+               self.arduino.write(f"{base_speed},{base_rotation}\n".encode('utf-8'))
+               self.last_sent_cmd = f"{base_speed},{base_rotation}\n"
                self.last_command_time = time.time()
            except: pass
    
@@ -341,10 +392,8 @@ def main():
    
    model_path = "/mnt/ArdorSSD/car_control_project_new/Datasets/cone_detector_v3.engine"
    detector = ConeDetector(model_path)
-   
    car = CarController()
    
-   # Общее состояние платформы (для обмена между потоками и ПК)
    robot_state = {
        'auto_mode': False,
        'msg': '',
@@ -354,7 +403,7 @@ def main():
    vision = VisionSystem(detector, car, robot_state)
    running = True
    
-   logger.info("Сервер готов. Двусторонняя телеметрия активна.")
+   logger.info("Сервер готов. Включен алгоритм Pure Pursuit.")
    
    try:
        while running:
@@ -362,7 +411,6 @@ def main():
                data, addr = sock.recvfrom(1024)
                command = data.decode('utf-8').strip()
                
-               # Обработка команд
                if command == "Q":
                    running = False
                    break
@@ -386,15 +434,13 @@ def main():
                        car.set_speeds(fwd, bck)
                    except: pass
                else:
-                   # Команды движения принимаем только в ручном режиме
                    if not robot_state['auto_mode']:
                        try:
-                           speed, steering = map(int, command.split(','))
+                           # Клиент присылает -1, 0, 1 для поворота
+                           speed, steering = map(float, command.split(','))
                            car.update(speed, steering)
                        except: pass
 
-               # --- ОТПРАВКА ТЕЛЕМЕТРИИ КЛИЕНТУ ---
-               # Очистка старых сообщений через 3 секунды
                if time.time() - robot_state['msg_time'] > 3.0:
                    robot_state['msg'] = ''
 

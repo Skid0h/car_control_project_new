@@ -1,10 +1,7 @@
-"""Запускается на Jetson, принимает команды управления с JETSON_IP + UDP_PORT
-   Поддерживает:
-   - Числовые команды: "скорость,поворот" (например "-1,-1")
-   - Команды установки скорости: "speed:100,80" (установить скорость вперед=100, назад=80)
-   - Буквенные команды: R (начать запись), C (остановить запись), Q (выход)
-   
-   Детекция конусов через YOLO на GPU с .engine файлом
+"""Запускается на Jetson.
+  Слушает все интерфейсы (0.0.0.0) на порту UDP_PORT.
+  Возвращает телеметрию клиенту для двусторонней связи.
+  Исправлена проблема ускоренного видео и заблокирован FPS на 15.
 """
 
 import socket
@@ -15,6 +12,7 @@ import logging
 import threading
 import sys
 import os
+import json
 from datetime import datetime
 import cv2
 import pyzed.sl as sl
@@ -26,9 +24,9 @@ import torch
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
 logger = logging.getLogger(__name__)
 
-UDP_IP = "192.168.137.50"
+# Слушаем ВСЕ сетевые интерфейсы, чтобы избежать ошибок биндинга
+UDP_IP = "0.0.0.0" 
 UDP_PORT = 5005
-
 Baud = 9600
 
 base_speed = 90
@@ -42,486 +40,384 @@ left_rotation = 180
 # Параметры детекции
 CONFIDENCE_THRESHOLD = 0.4
 IOU_THRESHOLD = 0.4
+ORANGE_CONE_CLASS_ID = 1  # ID класса оранжевого конуса в YOLO
 
-# Цвета для конусов (BGR формат для OpenCV)
 CONE_COLORS = {
-    0: (0, 255, 255),   # Желтый
-    1: (0, 165, 255),   # Оранжевый
-    2: (255, 0, 0)      # Синий
+   0: (0, 255, 255),   # Желтый
+   1: (0, 165, 255),   # Оранжевый
+   2: (255, 0, 0),     # Синий
+   3: (0, 0, 255)      # Красный
 }
 
-# Названия классов для отображения
 CLASS_NAMES = {
-    0: "Yellow",
-    1: "Orange", 
-    2: "Blue"
+   0: "Yellow", 1: "Orange", 2: "Blue", 3: "Red"
 }
 
 def find_arduino_port():
-    """Автоматически находит порт с Arduino"""
-    ports = serial.tools.list_ports.comports()
-    
-    for port in ports:
-        if ('Arduino' in port.description or
-            'CH340' in port.description or
-            'USB Serial' in port.description):
-            logger.info(f"Найден Arduino на порту {port.device} ({port.description})")
-            return port.device
-    
-    # Дополнительная проверка по VID/PID для Arduino
-    for port in ports:
-        if port.vid and port.pid:
-            if (port.vid == 0x2341) or (port.vid == 0x1A86):  # Arduino или CH340
-                logger.info(f"Найден Arduino по VID/PID на порту {port.device}")
-                return port.device
-    
-    logger.error("Arduino не найден")
-    return None
+   ports = serial.tools.list_ports.comports()
+   for port in ports:
+       if ('Arduino' in port.description or 'CH340' in port.description or 'USB Serial' in port.description):
+           return port.device
+   for port in ports:
+       if port.vid and port.pid:
+           if (port.vid == 0x2341) or (port.vid == 0x1A86):
+               return port.device
+   return None
 
 class ConeDetector:
-    """Класс для детекции конусов через YOLO с .engine файлом"""
-    
-    def __init__(self, model_path):
-        self.model = None
-        self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
-        
-        logger.info(f"Загрузка модели YOLO с {model_path}")
-        logger.info(f"Используется устройство: {self.device}")
-        
-        try:
-            # Загружаем модель без указания device
-            self.model = YOLO(model_path)
-            
-            # Для TensorRT (.engine) не нужно вызывать .to('cuda')
-            # Модель автоматически использует GPU если доступен
-            if self.device == 'cuda':
-                logger.info("✅ TensorRT модель загружена для GPU")
-            else:
-                logger.warning("⚠️ GPU не доступен, используется CPU")
-            
-            # Проверяем классы модели
-            if hasattr(self.model, 'names'):
-                logger.info(f"Классы модели: {self.model.names}")
-            else:
-                logger.info("Классы модели не определены, используем стандартные")
-                
-        except Exception as e:
-            logger.error(f"Ошибка загрузки модели: {e}")
-            self.model = None
-    
-    def detect(self, frame):
-        """Детекция конусов на кадре с использованием параметров CONFIDENCE_THRESHOLD и IOU_THRESHOLD"""
-        if self.model is None:
-            return frame, []
-        
-        try:
-            # Для TensorRT моделей передаем device в аргументах predict
-            results = self.model(
-                frame, 
-                conf=CONFIDENCE_THRESHOLD, 
-                iou=IOU_THRESHOLD,
-                verbose=False,
-                device=self.device  # Передаем устройство здесь
-            )
-            
-            detections = []
-            for result in results:
-                if result.boxes is not None:
-                    for box in result.boxes:
-                        x1, y1, x2, y2 = map(int, box.xyxy[0])
-                        conf = float(box.conf[0])
-                        cls = int(box.cls[0])
-                        
-                        detections.append({
-                            'bbox': (x1, y1, x2, y2),
-                            'conf': conf,
-                            'class': cls,
-                            'center': ((x1 + x2) // 2, (y1 + y2) // 2)
-                        })
-                        
-                        # Рисуем bounding box с правильным цветом
-                        color = CONE_COLORS.get(cls, (0, 255, 0))
-                        cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-                        
-                        # Подпись класса с цветом
-                        class_name = CLASS_NAMES.get(cls, f"Class_{cls}")
-                        cv2.putText(frame, f"{class_name} {conf:.2f}", (x1, y1-10),
-                                  cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
-                        
-                        # Центр конуса
-                        cv2.circle(frame, ((x1 + x2) // 2, (y1 + y2) // 2), 4, (255, 255, 255), -1)
-            
-            return frame, detections
-            
-        except Exception as e:
-            logger.error(f"Ошибка детекции: {e}")
-            return frame, []
+   def __init__(self, model_path):
+       self.model = None
+       self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
+       logger.info(f"Загрузка модели YOLO с {model_path} на {self.device}")
+       try:
+           self.model = YOLO(model_path)
+           if hasattr(self.model, 'names'):
+               logger.info(f"Классы модели: {self.model.names}")
+       except Exception as e:
+           logger.error(f"Ошибка загрузки модели: {e}")
+           self.model = None
+   
+   def detect(self, frame):
+       if self.model is None:
+           return frame, []
+       try:
+           results = self.model(frame, conf=CONFIDENCE_THRESHOLD, iou=IOU_THRESHOLD, verbose=False, device=self.device)
+           detections = []
+           for result in results:
+               if result.boxes is not None:
+                   for box in result.boxes:
+                       x1, y1, x2, y2 = map(int, box.xyxy[0])
+                       conf = float(box.conf[0])
+                       cls = int(box.cls[0])
+                       
+                       detections.append({
+                           'bbox': (x1, y1, x2, y2),
+                           'conf': conf,
+                           'class': cls,
+                           'center': ((x1 + x2) // 2, (y1 + y2) // 2)
+                       })
+                       
+                       color = CONE_COLORS.get(cls, (0, 255, 0))
+                       cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+                       class_name = CLASS_NAMES.get(cls, f"Class_{cls}")
+                       cv2.putText(frame, f"{class_name} {conf:.2f}", (x1, y1-10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+                       cv2.circle(frame, ((x1 + x2) // 2, (y1 + y2) // 2), 4, (255, 255, 255), -1)
+           return frame, detections
+       except Exception as e:
+           logger.error(f"Ошибка детекции: {e}")
+           return frame, []
 
-class VideoRecorder:
-    """Класс для управления записью ZED-камеры с детекцией конусов (обновленная версия)"""
-    
-    def __init__(self, detector):
-        self.zed = None
-        self.video_writer = None
-        self.is_recording = False
-        self.recording_thread = None
-        self.stop_recording_flag = False
-        self.output_folder = "zed_recordings"
-        self.detector = detector
-        
-        # Параметры для FPS
-        self.current_fps = 0
-        self.target_fps = 15
-        self.frame_time = 1.0 / self.target_fps
-        
-        # Создаем папку для записей
-        if not os.path.exists(self.output_folder):
-            os.makedirs(self.output_folder)
-            logger.info(f"Создана папка для записей: {self.output_folder}")
-    
-    def convert_to_compatible_format(self, input_path, output_path):
-        """Конвертирует видео в формат MP4"""
-        try:
-            cmd = [
-                'ffmpeg', '-i', input_path,
-                '-c:v', 'libx264',
-                '-preset', 'fast',
-                '-crf', '23',
-                '-pix_fmt', 'yuv420p',
-                '-y', output_path
-            ]
-            subprocess.run(cmd, check=True, capture_output=True)
-            logger.info(f"Видео сконвертировано: {output_path}")
-            return True
-        except Exception as e:
-            logger.error(f"Ошибка конвертации: {e}")
-            return False
-    
-    def start_recording(self):
-        """Запуск записи видео"""
-        if self.is_recording:
-            logger.warning("Запись уже идет")
-            return False
-        
-        logger.info("Запуск записи видео с детекцией конусов...")
-        self.stop_recording_flag = False
-        self.recording_thread = threading.Thread(target=self._recording_loop)
-        self.recording_thread.start()
-        return True
-    
-    def _recording_loop(self):
-        """Основной цикл записи с детекцией (обновленная версия)"""
-        self.zed = sl.Camera()
-        init_params = sl.InitParameters()
-        init_params.camera_resolution = sl.RESOLUTION.HD720
-        init_params.camera_fps = 30
-        init_params.depth_mode = sl.DEPTH_MODE.PERFORMANCE
-        init_params.coordinate_units = sl.UNIT.METER
-        init_params.sdk_verbose = 0
-        init_params.sdk_gpu_id = 0
+class VisionSystem:
+   def __init__(self, detector, car, robot_state):
+       self.detector = detector
+       self.car = car
+       self.robot_state = robot_state
+       self.zed = sl.Camera()
+       self.is_recording = False
+       self.video_writer = None
+       self.running = True
+       self.output_folder = "zed_recordings"
+       
+       # ЖЕСТКАЯ ФИКСАЦИЯ FPS
+       self.target_fps = 15.0 
+       self.frame_time = 1.0 / self.target_fps  # Должно быть ~0.0666 сек на кадр
+       
+       if not os.path.exists(self.output_folder):
+           os.makedirs(self.output_folder)
+           
+       self.thread = threading.Thread(target=self._vision_loop)
+       self.thread.start()
+       
+   def _convert_video(self, input_path, output_path):
+       try:
+           # Указываем ffmpeg сохранять исходный фреймрейт с ключом -r
+           cmd = ['ffmpeg', '-i', input_path, '-r', str(self.target_fps), '-c:v', 'libx264', '-preset', 'fast', '-crf', '23', '-pix_fmt', 'yuv420p', '-y', output_path]
+           subprocess.run(cmd, check=True, capture_output=True)
+           logger.info(f"Видео сконвертировано: {output_path}")
+           os.remove(input_path)
+       except Exception as e:
+           logger.error(f"Ошибка конвертации: {e}")
+           
+   def _vision_loop(self):
+       init_params = sl.InitParameters()
+       init_params.camera_resolution = sl.RESOLUTION.HD720
+       # Ограничиваем саму ZED камеру, чтобы она не пыталась отдавать лишние кадры
+       init_params.camera_fps = int(self.target_fps) 
+       init_params.depth_mode = sl.DEPTH_MODE.PERFORMANCE
+       init_params.coordinate_units = sl.UNIT.METER
+       
+       if self.zed.open(init_params) != sl.ERROR_CODE.SUCCESS:
+           logger.error("Не удалось открыть ZED-камеру. Автономный режим недоступен.")
+           self.running = False
+           return
 
-        if self.zed.open(init_params) != sl.ERROR_CODE.SUCCESS:
-            logger.error("Не удалось инициализировать ZED-камеру")
-            return
+       runtime_params = sl.RuntimeParameters()
+       image_zed = sl.Mat()
+       depth_zed = sl.Mat()
+       
+       frame_count = 0
+       fps_counter = 0
+       current_fps = 0
+       fps_last_time = time.time()
+       
+       temp_video_path = None
+       final_video_path = None
 
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        temp_video_path = os.path.join(self.output_folder, f"temp_{timestamp}.avi")
-        final_video_path = os.path.join(self.output_folder, f"zed_recording_{timestamp}.mp4")
-        
-        logger.info(f"Запись начата: {final_video_path}")
+       logger.info(f"Система зрения запущена. FPS строго заблокирован на {self.target_fps}")
 
-        runtime_params = sl.RuntimeParameters()
-        image_zed = sl.Mat()
-        depth_zed = sl.Mat()
-        frame_count = 0
-        
-        # Для расчета FPS
-        fps_counter = 0
-        fps_last_time = time.time()
-        current_fps = 0
-        
-        last_frame_time = time.time()
+       while self.running:
+           loop_start_time = time.time() # Засекаем время старта обработки кадра
+           
+           if self.zed.grab(runtime_params) == sl.ERROR_CODE.SUCCESS:
+               self.zed.retrieve_image(image_zed, sl.VIEW.LEFT)
+               image_np = image_zed.get_data()
+               if image_np.shape[2] == 4:
+                   image_np = cv2.cvtColor(image_np, cv2.COLOR_BGRA2BGR)
+                   
+               self.zed.retrieve_measure(depth_zed, sl.MEASURE.DEPTH)
+               depth_data = depth_zed.get_data()
+               
+               image_np, detections = self.detector.detect(image_np)
+               
+               target_detected = False
+               for det in detections:
+                   cx, cy = det['center']
+                   if 0 <= cy < depth_data.shape[0] and 0 <= cx < depth_data.shape[1]:
+                       depth = depth_data[cy, cx]
+                       if np.isfinite(depth) and depth > 0:
+                           cv2.putText(image_np, f"{depth:.2f}m", (det['bbox'][0], det['bbox'][1]-25), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
+                           
+                           # Проверяем на оранжевый конус
+                           if det['class'] == ORANGE_CONE_CLASS_ID and depth <= 0.4:
+                               target_detected = True
 
-        # Получаем первый кадр для инициализации
-        if self.zed.grab(runtime_params) == sl.ERROR_CODE.SUCCESS:
-            self.zed.retrieve_image(image_zed, sl.VIEW.LEFT)
-            image_np = image_zed.get_data()
-            
-            if image_np.shape[2] == 4:
-                image_np = cv2.cvtColor(image_np, cv2.COLOR_BGRA2BGR)
-            
-            height, width = image_np.shape[:2]
-            fourcc = cv2.VideoWriter_fourcc(*'MJPG')
-            
-            # Используем текущий FPS для записи
-            actual_fps = current_fps if current_fps > 0 else self.target_fps
-            self.video_writer = cv2.VideoWriter(temp_video_path, fourcc, actual_fps, (width, height))
-            
-            if not self.video_writer.isOpened():
-                logger.error("Не удалось открыть VideoWriter")
-                self.zed.close()
-                return
+               # --- ЛОГИКА АВТОМАТИЧЕСКОГО РЕЖИМА ---
+               if self.robot_state.get('auto_mode', False):
+                   if target_detected:
+                       logger.info("Оранжевый конус на дистанции <= 0.4м! Возврат в РУЧНОЙ режим.")
+                       self.robot_state['auto_mode'] = False
+                       self.robot_state['msg'] = "ОРАНЖЕВЫЙ КОНУС! АВТОПИЛОТ ОСТАНОВЛЕН."
+                       self.robot_state['msg_time'] = time.time()
+                       self.car.stop()
+                   else:
+                       self.car.update(1, 0) # Движение прямо
+               # -------------------------------------
 
-        self.is_recording = True
+               fps_counter += 1
+               if time.time() - fps_last_time >= 1.0:
+                   current_fps = fps_counter
+                   fps_counter = 0
+                   fps_last_time = time.time()
+               
+               # Выводим реальный FPS для контроля (должен стабильно держаться около 15)
+               cv2.putText(image_np, f"FPS: {current_fps} Mode: {'AUTO' if self.robot_state.get('auto_mode') else 'MANUAL'}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+               
+               if self.is_recording:
+                   cv2.putText(image_np, f"REC: {frame_count}", (10, 55), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+                   
+                   if self.video_writer is None:
+                       timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                       temp_video_path = os.path.join(self.output_folder, f"temp_{timestamp}.avi")
+                       final_video_path = os.path.join(self.output_folder, f"zed_recording_{timestamp}.mp4")
+                       height, width = image_np.shape[:2]
+                       fourcc = cv2.VideoWriter_fourcc(*'MJPG')
+                       
+                       # РЕШЕНИЕ ПРОБЛЕМЫ УСКОРЕНИЯ:
+                       # Жестко указываем self.target_fps (15.0), игнорируем любые скачки current_fps
+                       self.video_writer = cv2.VideoWriter(temp_video_path, fourcc, float(self.target_fps), (width, height))
+                       frame_count = 0
+                       
+                   self.video_writer.write(image_np)
+                   frame_count += 1
+               else:
+                   if self.video_writer is not None:
+                       self.video_writer.release()
+                       self.video_writer = None
+                       threading.Thread(target=self._convert_video, args=(temp_video_path, final_video_path)).start()
+           
+           # --- ПРОГРАММНЫЙ БЛОКИРАТОР ВРЕМЕНИ (Стабилизация FPS) ---
+           processing_time = time.time() - loop_start_time
+           if processing_time < self.frame_time:
+               # Если Jetson справился с кадром быстрее, чем за 0.066 сек, мы усыпляем поток на оставшееся время.
+               # Это гарантирует, что следующий кадр начнет обрабатываться ровно вовремя.
+               time.sleep(self.frame_time - processing_time)
 
-        try:
-            while not self.stop_recording_flag:
-                current_time = time.time()
-                
-                if current_time - last_frame_time >= self.frame_time:
-                    if self.zed.grab(runtime_params) == sl.ERROR_CODE.SUCCESS:
-                        # Получаем изображение
-                        self.zed.retrieve_image(image_zed, sl.VIEW.LEFT)
-                        image_np = image_zed.get_data()
-                        
-                        if image_np.shape[2] == 4:
-                            image_np = cv2.cvtColor(image_np, cv2.COLOR_BGRA2BGR)
-                        
-                        # Получаем глубину
-                        self.zed.retrieve_measure(depth_zed, sl.MEASURE.DEPTH)
-                        depth_data = depth_zed.get_data()
-                        
-                        # Детекция конусов с параметрами CONFIDENCE_THRESHOLD и IOU_THRESHOLD
-                        image_np, detections = self.detector.detect(image_np)
-                        
-                        # Добавляем информацию о глубине для каждого конуса
-                        for det in detections:
-                            cx, cy = det['center']
-                            if 0 <= cy < depth_data.shape[0] and 0 <= cx < depth_data.shape[1]:
-                                depth = depth_data[cy, cx]
-                                if np.isfinite(depth) and depth > 0:
-                                    cv2.putText(image_np, f"{depth:.2f}m", 
-                                              (det['bbox'][0], det['bbox'][1]-25),
-                                              cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
-                        
-                        # Расчет FPS
-                        fps_counter += 1
-                        if current_time - fps_last_time >= 1.0:
-                            current_fps = fps_counter
-                            fps_counter = 0
-                            fps_last_time = current_time
-                        
-                        # Отображение FPS на видео
-                        cv2.putText(image_np, f"FPS: {current_fps}", (10, 30), 
-                                  cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-                        
-                        # Добавляем информацию о записи и количестве конусов
-                        if self.is_recording:
-                            cv2.putText(image_np, f"REC: {frame_count}", (10, 55),
-                                      cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+       if self.video_writer:
+           self.video_writer.release()
+       self.zed.close()
 
-                        # Записываем кадр
-                        self.video_writer.write(image_np)
-                        frame_count += 1
-                        
-                        if frame_count % 30 == 0:
-                            logger.info(f"Записано кадров: {frame_count}, конусов в кадре: {len(detections)}")
-                            
-                        last_frame_time = current_time
-                        
-        finally:
-            if self.video_writer:
-                self.video_writer.release()
-                logger.info(f"Временное видео сохранено: {temp_video_path}")
-                logger.info(f"Всего кадров: {frame_count}")
-                
-                # Конвертируем в совместимый формат
-                logger.info("Конвертация видео...")
-                if self.convert_to_compatible_format(temp_video_path, final_video_path):
-                    os.remove(temp_video_path)
-                    logger.info(f"Временный файл удален")
-                else:
-                    logger.error("Ошибка конвертации, временный файл сохранен")
-            
-            self.zed.close()
-            self.is_recording = False
-            logger.info("Запись остановлена")
-    
-    def stop_recording(self):
-        """Остановка записи"""
-        if not self.is_recording:
-            logger.warning("Нет активной записи")
-            return False
-        
-        logger.info("Остановка записи видео...")
-        self.stop_recording_flag = True
-        if self.recording_thread:
-            self.recording_thread.join(timeout=5.0)
-        return True
+   def start_recording(self):
+       self.is_recording = True
+
+   def stop_recording(self):
+       self.is_recording = False
+
+   def close(self):
+       self.running = False
+       self.thread.join(timeout=5.0)
 
 class CarController:
-    def __init__(self):
-        self.forward_speed = forward_speed
-        self.back_speed = back_speed
-        self.arduino = None
-        self.last_command_time = 0
-        
-        port = find_arduino_port()
-        if port is None:
-            logger.error("Arduino не найден, управление движением недоступно")
-            self.arduino = None
-            return
-        
-        self.arduino = None
-        try:
-            self.arduino = serial.Serial(port, Baud, timeout=1)
-            time.sleep(2)
-            self.stop()
-            time.sleep(0.5)
-            logger.info(f"Arduino успешно подключен к {port}")
-        except Exception as e:
-            logger.error(f"Ошибка подключения к {port}: {e}")
-            self.arduino = None
-    
-    def set_speeds(self, forward, back):
-        """Установка новых значений скорости"""
-        self.forward_speed = forward
-        self.back_speed = back
-        logger.info(f"Скорость установлена: вперед={forward}, назад={back}")
-    
-    def update(self, speed, steering):
-        if not self.arduino:
-            logger.warning("Arduino не подключен, команда игнорируется")
-            return
-
-        motor_value = base_speed
-        if speed > 0:
-            motor_value = self.forward_speed
-        elif speed < 0:
-            motor_value = self.back_speed
-        
-        steer_value = base_rotation
-        if steering < 0:
-            steer_value = left_rotation
-        elif steering > 0:
-            steer_value = right_rotation
-        
-        command = f"{motor_value},{steer_value}\n"
-        try:
-            self.arduino.write(command.encode('utf-8'))
-            self.last_command_time = time.time()
-            logger.debug(f"Команда движения: {command.strip()}")
-        except serial.SerialException as e:
-            logger.error(f"Ошибка отправки: {e}")
-            self.arduino = None
-    
-    def stop(self):
-        if self.arduino:
-            try:
-                self.arduino.write("90,90\n".encode('utf-8'))
-                self.last_command_time = time.time()
-                logger.debug("Команда: СТОП")
-            except:
-                pass
-    
-    def check_stop(self):
-        """Проверка и остановка если давно не было команд"""
-        if self.arduino and time.time() - self.last_command_time > 1.0:
-            self.stop()
-    
-    def close(self):
-        self.stop()
-        time.sleep(0.1)
-        if self.arduino:
-            self.arduino.close()
-        logger.info("Arduino отключен")
+   def __init__(self):
+       self.lock = threading.Lock() # Блокировка для защиты Serial-порта
+       self.forward_speed = forward_speed
+       self.back_speed = back_speed
+       self.last_command_time = 0
+       self.last_sent_cmd = ""
+       self.last_sent_time = 0
+       
+       port = find_arduino_port()
+       self.arduino = None
+       if port is None:
+           logger.error("Arduino не найден")
+           return
+           
+       try:
+           self.arduino = serial.Serial(port, Baud, timeout=1)
+           time.sleep(2)
+           self.stop()
+           time.sleep(0.5)
+           logger.info(f"Arduino подключен: {port}")
+       except Exception as e:
+           logger.error(f"Ошибка подключения: {e}")
+           self.arduino = None
+   
+   def set_speeds(self, forward, back):
+       self.forward_speed = forward
+       self.back_speed = back
+   
+   def update(self, speed, steering):
+       if not self.arduino: return
+       
+       motor_value = base_speed
+       if speed > 0: motor_value = self.forward_speed
+       elif speed < 0: motor_value = self.back_speed
+       
+       steer_value = base_rotation
+       if steering < 0: steer_value = left_rotation
+       elif steering > 0: steer_value = right_rotation
+       
+       command = f"{motor_value},{steer_value}\n"
+       
+       current_time = time.time()
+       # В авто-режиме шлем не чаще 10 раз в секунду, чтобы не забить буфер
+       if command != self.last_sent_cmd or (current_time - self.last_sent_time) > 0.1:
+           with self.lock: # Защищаем доступ к порту
+               try:
+                   self.arduino.write(command.encode('utf-8'))
+                   self.last_sent_cmd = command
+                   self.last_sent_time = current_time
+                   self.last_command_time = current_time
+               except serial.SerialException as e:
+                   logger.error(f"Ошибка отправки: {e}")
+                   self.arduino = None
+   
+   def stop(self):
+       if not self.arduino: return
+       with self.lock:
+           try:
+               self.arduino.write("90,90\n".encode('utf-8'))
+               self.last_sent_cmd = "90,90\n"
+               self.last_command_time = time.time()
+           except: pass
+   
+   def check_stop(self):
+       if self.arduino and time.time() - self.last_command_time > 1.0:
+           self.stop()
+           
+   def close(self):
+       self.stop()
+       time.sleep(0.1)
+       if self.arduino: self.arduino.close()
 
 def main():
-    # Создаем UDP сокет
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    sock.settimeout(0.5)
-    
-    try:
-        sock.bind((UDP_IP, UDP_PORT))
-        logger.info(f"Сервер слушает порт {UDP_PORT}")
-    except OSError as e:
-        logger.error(f"Не удалось занять порт {UDP_PORT}: {e}")
-        logger.error("Убедитесь, что другой процесс не использует этот порт")
-        sys.exit(1)
-    
-    # Инициализируем детектор конусов с .engine файлом
-    model_path = "/mnt/ArdorSSD/car_control_project_new/Datasets/cone_detector_v3.engine"
-    detector = ConeDetector(model_path)
-    
-    # Инициализируем контроллеры
-    car = CarController()
-    recorder = VideoRecorder(detector)
-    
-    last_command_time = time.time()
-    running = True
-    
-    logger.info("Сервер готов к приему команд:")
-    logger.info("  - Движение: 'скорость,поворот' (например '1,0' - вперед, '-1,-1' - назад+влево)")
-    logger.info("  - Скорость: 'speed:100,80' - установить скорость вперед=100, назад=80")
-    logger.info("  - R - начать запись видео (с детекцией конусов)")
-    logger.info("  - C - остановить запись видео")
-    logger.info("  - Q - выход из программы")
-    logger.info(f"Текущая скорость: вперед={car.forward_speed}, назад={car.back_speed}")
-    logger.info(f"Параметры детекции: confidence={CONFIDENCE_THRESHOLD}, iou={IOU_THRESHOLD}")
-    
-    try:
-        while running:
-            try:
-                data, addr = sock.recvfrom(1024)
-                command = data.decode('utf-8').strip()
-                last_command_time = time.time()
-                
-                logger.info(f"Получена команда: '{command}' от {addr}")
-                
-                # Обработка команд
-                if command == "Q":
-                    logger.info("Получена команда Q - выход")
-                    running = False
-                    break
-                    
-                elif command == "R":
-                    logger.info("Получена команда R - начать запись")
-                    if not recorder.is_recording:
-                        recorder.start_recording()
-                    else:
-                        logger.info("Запись уже идет")
-                        
-                elif command == "C":
-                    logger.info("Получена команда C - остановить запись")
-                    if recorder.is_recording:
-                        recorder.stop_recording()
-                    else:
-                        logger.info("Нет активной записи")
-                
-                elif command.startswith("speed:"):
-                    # Команда установки скорости: speed:100,80
-                    try:
-                        speed_str = command[6:]
-                        forward, back = map(int, speed_str.split(','))
-                        car.set_speeds(forward, back)
-                    except (ValueError, IndexError) as e:
-                        logger.error(f"Ошибка парсинга команды скорости: {e}")
-                        
-                else:
-                    # Пытаемся распарсить как команду движения (speed,steering)
-                    try:
-                        speed, steering = map(int, command.split(','))
-                        car.update(speed, steering)
-                        logger.debug(f"Движение: скорость={speed}, поворот={steering}")
-                    except ValueError:
-                        logger.warning(f"Неизвестная команда: {command}")
-                    
-            except socket.timeout:
-                # Проверяем, не пора ли остановить машину
-                car.check_stop()
-                    
-    except KeyboardInterrupt:
-        logger.info("Остановка сервера...")
-    finally:
-        # Останавливаем запись если она идет
-        if recorder.is_recording:
-            logger.info("Остановка записи перед выходом...")
-            recorder.stop_recording()
-        
-        # Отключаем Arduino
-        car.close()
-        sock.close()
-        logger.info("Сервер остановлен")
+   sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+   sock.settimeout(0.5)
+   try:
+       sock.bind((UDP_IP, UDP_PORT))
+       logger.info(f"Сервер слушает порт {UDP_PORT}")
+   except OSError as e:
+       logger.error(f"Ошибка порта {UDP_PORT}: {e}")
+       sys.exit(1)
+   
+   model_path = "/mnt/ArdorSSD/car_control_project_new/Datasets/cone_detector_v3.engine"
+   detector = ConeDetector(model_path)
+   
+   car = CarController()
+   
+   # Общее состояние платформы (для обмена между потоками и ПК)
+   robot_state = {
+       'auto_mode': False,
+       'msg': '',
+       'msg_time': 0
+   }
+   
+   vision = VisionSystem(detector, car, robot_state)
+   running = True
+   
+   logger.info("Сервер готов. Двусторонняя телеметрия активна.")
+   
+   try:
+       while running:
+           try:
+               data, addr = sock.recvfrom(1024)
+               command = data.decode('utf-8').strip()
+               
+               # Обработка команд
+               if command == "Q":
+                   running = False
+                   break
+               elif command == "A":
+                   if not robot_state['auto_mode']:
+                       logger.info("Включен АВТОМАТИЧЕСКИЙ режим")
+                       robot_state['auto_mode'] = True
+                       robot_state['msg'] = ''
+               elif command == "S":
+                   if robot_state['auto_mode']:
+                       logger.info("Включен РУЧНОЙ режим")
+                       robot_state['auto_mode'] = False
+                       car.stop()
+               elif command == "R":
+                   vision.start_recording()
+               elif command == "C":
+                   vision.stop_recording()
+               elif command.startswith("speed:"):
+                   try:
+                       fwd, bck = map(int, command[6:].split(','))
+                       car.set_speeds(fwd, bck)
+                   except: pass
+               else:
+                   # Команды движения принимаем только в ручном режиме
+                   if not robot_state['auto_mode']:
+                       try:
+                           speed, steering = map(int, command.split(','))
+                           car.update(speed, steering)
+                       except: pass
+
+               # --- ОТПРАВКА ТЕЛЕМЕТРИИ КЛИЕНТУ ---
+               # Очистка старых сообщений через 3 секунды
+               if time.time() - robot_state['msg_time'] > 3.0:
+                   robot_state['msg'] = ''
+
+               telemetry = {
+                   "mode": "AUTO" if robot_state['auto_mode'] else "MANUAL",
+                   "rec": vision.is_recording,
+                   "fwd": car.forward_speed,
+                   "bck": car.back_speed,
+                   "msg": robot_state['msg']
+               }
+               sock.sendto(json.dumps(telemetry).encode('utf-8'), addr)
+
+           except socket.timeout:
+               if not robot_state['auto_mode']:
+                   car.check_stop()
+                   
+   except KeyboardInterrupt:
+       logger.info("Остановка сервера...")
+   finally:
+       vision.close()
+       car.close()
+       sock.close()
+       logger.info("Сервер остановлен")
 
 if __name__ == "__main__":
-    main()
+   main()

@@ -1,4 +1,4 @@
-"""Запускается на ПК, отправляет команды управления на JETSON_IP + UDP_PORT, с записью видео"""
+"""Запускается на ПК, отправляет команды управления на JETSON_IP + UDP_PORT"""
 
 import pygame
 import socket
@@ -14,7 +14,7 @@ Tick_rate = 20
 
 def main():
     pygame.init()
-    screen = pygame.display.set_mode((500, 350))
+    screen = pygame.display.set_mode((500, 550))
     pygame.display.set_caption(f"Пульт: {JETSON_IP}")
     font = pygame.font.SysFont('Arial', 20, bold=True)
     small_font = pygame.font.SysFont('Arial', 16)
@@ -23,6 +23,10 @@ def main():
     last_udp_cmd = ""
     last_system_cmd = ""
     
+    # Текущие значения скорости
+    current_forward_speed = 98
+    current_back_speed = 82
+    
     controls = [
         "УПРАВЛЕНИЕ ДВИЖЕНИЕМ:",
         "Стрелки          - Движение и поворот",
@@ -30,6 +34,12 @@ def main():
         "УПРАВЛЕНИЕ ЗАПИСЬЮ:",
         "R                - НАЧАТЬ запись видео",
         "C                - ОСТАНОВИТЬ запись",
+        "",
+        "УПРАВЛЕНИЕ СКОРОСТЬЮ:",
+        "1                - УМЕНЬШИТЬ скорость (вперед-1, назад+1)",
+        "2                - УВЕЛИЧИТЬ скорость (вперед+1, назад-1)",
+        "",
+        "ВЫХОД:",
         "Q                - ВЫЙТИ из программы",
         "",
         f"Связь: {JETSON_IP}:{UDP_PORT}"
@@ -40,12 +50,13 @@ def main():
     
     while running:
         system_cmd = ""
+        speed_changed = False
         
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 running = False
             
-            # Обработка нажатий клавиш для системных команд
+            # Обработка нажатий клавиш
             if event.type == pygame.KEYDOWN:
                 if event.key == pygame.K_r:
                     system_cmd = "R"
@@ -57,6 +68,20 @@ def main():
                     system_cmd = "Q"
                     logger.info(f"Отправлено: {system_cmd} - ВЫХОД")
                     running = False
+                elif event.key == pygame.K_1:
+                    # Уменьшаем forward, увеличиваем back
+                    current_forward_speed = max(70, current_forward_speed - 1)
+                    current_back_speed = min(150, current_back_speed + 1)
+                    system_cmd = f"speed:{current_forward_speed},{current_back_speed}"
+                    logger.info(f"Скорость уменьшена: вперед={current_forward_speed}, назад={current_back_speed}")
+                    speed_changed = True
+                elif event.key == pygame.K_2:
+                    # Увеличиваем forward, уменьшаем back
+                    current_forward_speed = min(150, current_forward_speed + 1)
+                    current_back_speed = max(70, current_back_speed - 1)
+                    system_cmd = f"speed:{current_forward_speed},{current_back_speed}"
+                    logger.info(f"Скорость увеличена: вперед={current_forward_speed}, назад={current_back_speed}")
+                    speed_changed = True
         
         keys = pygame.key.get_pressed()
         
@@ -75,8 +100,8 @@ def main():
             except Exception as e:
                 logger.error(f"Ошибка сети: {e}")
         
-        # Отправка системной команды (R, C, Q)
-        if system_cmd and system_cmd != last_system_cmd:
+        # Отправка системной команды (R, C, Q, speed)
+        if (system_cmd and system_cmd != last_system_cmd) or speed_changed:
             try:
                 sock.sendto(system_cmd.encode('utf-8'), (JETSON_IP, UDP_PORT))
                 last_system_cmd = system_cmd
@@ -91,18 +116,29 @@ def main():
             color = (200, 200, 200)
             if "ЗАПИСЬ" in line:
                 color = (255, 200, 0)
-            elif "ВЫЙТИ" in line:
+            elif "СКОРОСТЬ" in line:
+                color = (100, 255, 100)
+            elif "ВЫХОД" in line:
                 color = (255, 100, 100)
             screen.blit(small_font.render(line, True, color), (20, y_offset + i*22))
         
         # Текущее состояние
         status_y = y_offset + len(controls)*22 + 10
-        screen.blit(font.render(f"Движение: [{udp_cmd}]", True, (255, 255, 0)), (20, status_y))
         
+        # Отображение текущей команды движения
+        screen.blit(font.render(f"Команда движения: [{udp_cmd}]", True, (255, 255, 0)), (20, status_y))
+        
+        # Отображение текущих значений скорости
+        speed_y = status_y + 30
+        screen.blit(font.render(f"ТЕКУЩАЯ СКОРОСТЬ:", True, (100, 255, 100)), (20, speed_y))
+        screen.blit(font.render(f"  Вперед: {current_forward_speed}", True, (0, 255, 0)), (40, speed_y + 25))
+        screen.blit(font.render(f"  Назад:  {current_back_speed}", True, (255, 100, 100)), (40, speed_y + 50))
+        
+        # Отображение статуса записи
         if last_system_cmd in ['R', 'C']:
             status_text = "ЗАПИСЬ АКТИВНА" if last_system_cmd == 'R' else "ЗАПИСЬ ОСТАНОВЛЕНА"
             status_color = (255, 0, 0) if last_system_cmd == 'R' else (0, 255, 0)
-            screen.blit(font.render(f"Статус: {status_text}", True, status_color), (20, status_y + 30))
+            screen.blit(font.render(f"Статус: {status_text}", True, status_color), (20, speed_y + 80))
         
         pygame.display.flip()
         clock.tick(Tick_rate)

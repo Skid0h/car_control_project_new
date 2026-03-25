@@ -12,3 +12,6 @@ https://disk.yandex.ru/d/y6o3viAnsxHCWg
 
 Тест датасета v3 Yolo8
 https://disk.yandex.ru/d/1vtidZV4uAhzYg
+
+Тест авто-езды 1:
+https://disk.yandex.ru/d/Aba762vZcoyRgg

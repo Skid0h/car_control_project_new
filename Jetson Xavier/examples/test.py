@@ -1,6 +1,7 @@
 """Запускается на Jetson.
   Слушает все интерфейсы (0.0.0.0) на порту UDP_PORT.
   Возвращает телеметрию клиенту для двусторонней связи.
+  Исправлена проблема ускоренного видео и заблокирован FPS на 15.
 """
 
 import socket
@@ -116,7 +117,10 @@ class VisionSystem:
        self.video_writer = None
        self.running = True
        self.output_folder = "zed_recordings"
-       self.target_fps = 15
+       
+       # ЖЕСТКАЯ ФИКСАЦИЯ FPS
+       self.target_fps = 15.0 
+       self.frame_time = 1.0 / self.target_fps  # Должно быть ~0.0666 сек на кадр
        
        if not os.path.exists(self.output_folder):
            os.makedirs(self.output_folder)
@@ -126,7 +130,8 @@ class VisionSystem:
        
    def _convert_video(self, input_path, output_path):
        try:
-           cmd = ['ffmpeg', '-i', input_path, '-c:v', 'libx264', '-preset', 'fast', '-crf', '23', '-pix_fmt', 'yuv420p', '-y', output_path]
+           # Указываем ffmpeg сохранять исходный фреймрейт с ключом -r
+           cmd = ['ffmpeg', '-i', input_path, '-r', str(self.target_fps), '-c:v', 'libx264', '-preset', 'fast', '-crf', '23', '-pix_fmt', 'yuv420p', '-y', output_path]
            subprocess.run(cmd, check=True, capture_output=True)
            logger.info(f"Видео сконвертировано: {output_path}")
            os.remove(input_path)
@@ -136,7 +141,8 @@ class VisionSystem:
    def _vision_loop(self):
        init_params = sl.InitParameters()
        init_params.camera_resolution = sl.RESOLUTION.HD720
-       init_params.camera_fps = 30
+       # Ограничиваем саму ZED камеру, чтобы она не пыталась отдавать лишние кадры
+       init_params.camera_fps = int(self.target_fps) 
        init_params.depth_mode = sl.DEPTH_MODE.PERFORMANCE
        init_params.coordinate_units = sl.UNIT.METER
        
@@ -157,10 +163,11 @@ class VisionSystem:
        temp_video_path = None
        final_video_path = None
 
-       logger.info("Система зрения запущена")
+       logger.info(f"Система зрения запущена. FPS строго заблокирован на {self.target_fps}")
 
        while self.running:
-           current_time = time.time()
+           loop_start_time = time.time() # Засекаем время старта обработки кадра
+           
            if self.zed.grab(runtime_params) == sl.ERROR_CODE.SUCCESS:
                self.zed.retrieve_image(image_zed, sl.VIEW.LEFT)
                image_np = image_zed.get_data()
@@ -197,11 +204,12 @@ class VisionSystem:
                # -------------------------------------
 
                fps_counter += 1
-               if current_time - fps_last_time >= 1.0:
+               if time.time() - fps_last_time >= 1.0:
                    current_fps = fps_counter
                    fps_counter = 0
-                   fps_last_time = current_time
+                   fps_last_time = time.time()
                
+               # Выводим реальный FPS для контроля (должен стабильно держаться около 15)
                cv2.putText(image_np, f"FPS: {current_fps} Mode: {'AUTO' if self.robot_state.get('auto_mode') else 'MANUAL'}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
                
                if self.is_recording:
@@ -213,8 +221,10 @@ class VisionSystem:
                        final_video_path = os.path.join(self.output_folder, f"zed_recording_{timestamp}.mp4")
                        height, width = image_np.shape[:2]
                        fourcc = cv2.VideoWriter_fourcc(*'MJPG')
-                       actual_fps = current_fps if current_fps > 0 else self.target_fps
-                       self.video_writer = cv2.VideoWriter(temp_video_path, fourcc, actual_fps, (width, height))
+                       
+                       # РЕШЕНИЕ ПРОБЛЕМЫ УСКОРЕНИЯ:
+                       # Жестко указываем self.target_fps (15.0), игнорируем любые скачки current_fps
+                       self.video_writer = cv2.VideoWriter(temp_video_path, fourcc, float(self.target_fps), (width, height))
                        frame_count = 0
                        
                    self.video_writer.write(image_np)
@@ -224,8 +234,13 @@ class VisionSystem:
                        self.video_writer.release()
                        self.video_writer = None
                        threading.Thread(target=self._convert_video, args=(temp_video_path, final_video_path)).start()
-           else:
-               time.sleep(0.01)
+           
+           # --- ПРОГРАММНЫЙ БЛОКИРАТОР ВРЕМЕНИ (Стабилизация FPS) ---
+           processing_time = time.time() - loop_start_time
+           if processing_time < self.frame_time:
+               # Если Jetson справился с кадром быстрее, чем за 0.066 сек, мы усыпляем поток на оставшееся время.
+               # Это гарантирует, что следующий кадр начнет обрабатываться ровно вовремя.
+               time.sleep(self.frame_time - processing_time)
 
        if self.video_writer:
            self.video_writer.release()

@@ -1,0 +1,28 @@
+{
+  "network": {
+    "udp_ip": "0.0.0.0",
+    "udp_port": 5005
+  },
+  "car": {
+    "baud_rate": 9600,
+    "neutral_speed": 1500,
+    "max_auto_speed": 1570,
+    "max_reverse_speed": 1430,
+    "center_steering": 90
+  },
+  "pid": {
+    "kp_gain": 1.0,
+    "ki_gain": 0.1,
+    "kd_gain": 0.25,
+    "max_integral": 1.5,
+    "ema_alpha": 0.4
+  },
+  "vision": {
+    "yolo_model_path": "/mnt/ArdorSSD/car_control_project_new/Datasets/cone_detector_v3.engine",
+    "confidence_threshold": 0.5,
+    "iou_threshold": 0.5,
+    "target_fps": 15.0,
+    "output_folder": "zed_recordings",
+    "camera_offset_x": -0.06
+  }
+}

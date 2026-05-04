@@ -1,5 +1,3 @@
-"""Код для запуска машинки через ардуино напрямую с ПК"""
-
 import time
 import pygame
 import serial
@@ -9,19 +7,20 @@ import logging
 Tick_rate = 10
 Baud = 9600
 
-base_speed = 90
-forward_speed = 98
-back_speed = 82
+# Значения в микросекундах
+base_speed = 1500
+forward_speed = 1600
+back_speed = 1400
 
-base_rotation = 90
-right_rotation = 30
-left_rotation = 150
+base_rotation = 130
+right_rotation = 90
+left_rotation = 170
 
 # Настройка логирования
 logging.basicConfig(level=logging.DEBUG, format='%(asctime)s [%(levelname)s] %(message)s')
 logger = logging.getLogger(__name__)
 
-#Автонахождение arduino
+# Автонахождение arduino
 def find_arduino_port():
     """Автоматически находит порт с Arduino"""
     ports = serial.tools.list_ports.comports()
@@ -42,7 +41,7 @@ class CarController:
         try:
             self.arduino = serial.Serial(port, Baud, timeout=1)
             time.sleep(2)  # Даем Arduino время на перезагрузку после подключения
-            self.stop()  # Начальная остановка
+            self.stop()    # Начальная остановка
             time.sleep(0.5)
             logger.info(f"Arduino подключен к {port}")
         except Exception as e:
@@ -60,7 +59,7 @@ class CarController:
         if steering < 0:
             steer_value = left_rotation  # Лево 
         elif steering > 0:
-            steer_value = right_rotation  # Право 
+            steer_value = right_rotation # Право 
         
         # Отправка команды
         command = f"{motor_value},{steer_value}\n"
@@ -68,7 +67,9 @@ class CarController:
         logger.debug(f"Команда: {command.strip()}")
     
     def stop(self):
-        self.arduino.write("90,90\n".encode())
+        # Отправляем правильную нейтраль (1500,90)
+        command = f"{base_speed},{base_rotation}\n"
+        self.arduino.write(command.encode())
         logger.debug("Команда остановки отправлена")
     
     def close(self):
@@ -78,15 +79,16 @@ class CarController:
         logger.info("Arduino отключен")
 
 def main():
+    global forward_speed, back_speed
+    
     pygame.init()
     
     # Создание окна
     screen_width = 500
-    screen_height = 350
+    screen_height = 400
     screen = pygame.display.set_mode((screen_width, screen_height))
-    pygame.display.set_caption("Управление машинкой")
+    pygame.display.set_caption("Управление машиной (Точная настройка)")
     
-    # Шрифт для отображения информации
     font = pygame.font.SysFont('Arial', 20)
     small_font = pygame.font.SysFont('Arial', 16)
     
@@ -103,25 +105,27 @@ def main():
         connection_color = (255, 0, 0)
         car = None
     
-    # Информация об управлении
     controls = [
         "УПРАВЛЕНИЕ:",
-        "Стрелка ВВЕРХ    - Медленно вперед",
-        "Стрелка ВНИЗ     - Медленно назад",
+        "Стрелка ВВЕРХ    - Вперед",
+        "Стрелка ВНИЗ     - Назад",
         "Стрелка ВЛЕВО    - Поворот налево",
         "Стрелка ВПРАВО   - Поворот направо",
+        "1                - УВЕЛИЧИТЬ скорость (можно зажать)",
+        "2                - УМЕНЬШИТЬ скорость (можно зажать)",
         "Q                - Выход",
     ]
     
-    # Переменные для отображения статуса
     current_speed = "СТОП"
     current_steering = "ПРЯМО"
     last_key_pressed = None
     debug_info = ""
     
+    # Таймер для контроля скорости изменения (чтобы прибавляло по 1 в секунду)
+    speed_change_timer = 0
+    
     logger.info("Программа управления машиной запущена")
     
-    # Основной цикл
     running = True
     clock = pygame.time.Clock()
     
@@ -132,39 +136,65 @@ def main():
             elif event.type == pygame.KEYDOWN:
                 key_name = pygame.key.name(event.key)
                 last_key_pressed = key_name
-                logger.info(f"Нажата клавиша: {key_name}")
+                
+                if key_name not in ['1', '2']:
+                    logger.info(f"Нажата клавиша: {key_name}")
                 
                 if event.key == pygame.K_q:
                     running = False
         
         keys = pygame.key.get_pressed()
         
+        # --- ИЗМЕНЕНИЕ СКОРОСТИ С ЗАЖАТИЕМ (1 РАЗ В СЕКУНДУ) ---
+        if keys[pygame.K_1]:  # Увеличиваем скорость
+            if speed_change_timer == 0:
+                forward_speed += 1
+                back_speed -= 1
+            
+            speed_change_timer += 1
+            if speed_change_timer >= Tick_rate:  # Прошла ровно 1 секунда
+                speed_change_timer = 0
+                
+        elif keys[pygame.K_2]:  # Уменьшаем скорость
+            if speed_change_timer == 0:
+                forward_speed -= 1
+                back_speed += 1
+                
+            speed_change_timer += 1
+            if speed_change_timer >= Tick_rate:  # Прошла ровно 1 секунда
+                speed_change_timer = 0
+        else:
+            # Сбрасываем таймер, если кнопки 1 и 2 отпущены
+            speed_change_timer = 0
+            
+        # Предохранители
+        forward_speed = max(1500, min(2000, forward_speed))
+        back_speed = max(1000, min(1500, back_speed))
+        # --------------------------------------------------------
+        
         speed = 0
         if keys[pygame.K_UP]:
-            speed = 1      # Вперед
+            speed = 1
             current_speed = "ВПЕРЕД"
         elif keys[pygame.K_DOWN]:
-            speed = -1     # Назад
+            speed = -1
             current_speed = "НАЗАД"
         else:
             current_speed = "СТОП"
         
-        # Определение поворота
         steering = 0
         if keys[pygame.K_LEFT]:
-            steering = -1  # Лево
+            steering = -1
             current_steering = "ЛЕВО"
         elif keys[pygame.K_RIGHT]:
-            steering = 1   # Право
+            steering = 1
             current_steering = "ПРАВО"
         else:
             current_steering = "ПРЯМО"
               
-        # Отправка команд на Arduino, если подключено
         if car:
             car.update(speed, steering)
         
-        # Отладочная информация
         debug_info = f"Скорость: {speed}, Руление: {steering}"
         if speed > 0:
             debug_info += f" | Мотор: {forward_speed} (вперед)" 
@@ -172,15 +202,15 @@ def main():
             debug_info += f" | Мотор: {back_speed} (назад)"
         else:
             debug_info += f" | Мотор: {base_speed} (стоп)"
+            
+        settings_info = f"Настройки скорости: Вперед = {forward_speed}, Назад = {back_speed}"
         
         # Отрисовка
-        screen.fill((30, 30, 40))  # Темно-синий фон
+        screen.fill((30, 30, 40))
         
-        # Отображение статуса подключения
         status_text = font.render(connection_status, True, connection_color)
         screen.blit(status_text, (20, 20))
         
-        # Отображение текущего состояния
         y_offset = 60
         state_text = font.render(f"Скорость: {current_speed}", True, (255, 255, 255))
         screen.blit(state_text, (20, y_offset))
@@ -188,24 +218,22 @@ def main():
         steer_text = font.render(f"Руль: {current_steering}", True, (255, 255, 255))
         screen.blit(steer_text, (20, y_offset + 30))
         
-        # Отображение последней нажатой клавиши
         if last_key_pressed:
             key_text = font.render(f"Последняя клавиша: {last_key_pressed.upper()}", True, (255, 200, 100))
             screen.blit(key_text, (20, y_offset + 60))
         
-        # Отображение отладочной информации
         debug_text = small_font.render(debug_info, True, (150, 255, 150))
         screen.blit(debug_text, (20, y_offset + 90))
         
-        # Отображение инструкций
+        settings_text = small_font.render(settings_info, True, (100, 200, 255))
+        screen.blit(settings_text, (20, y_offset + 110))
+        
         y_offset = 200
         for i, control in enumerate(controls):
             control_text = small_font.render(control, True, (200, 200, 200))
             screen.blit(control_text, (20, y_offset + i * 22))
         
-        # Обновление экрана
         pygame.display.flip()
-        
         clock.tick(Tick_rate)
     
     if car:
@@ -217,7 +245,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-    
-    
-
-    

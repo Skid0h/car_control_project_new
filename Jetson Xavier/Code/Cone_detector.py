@@ -6,13 +6,12 @@ logger = logging.getLogger(__name__)
 
 class ConeDetector:
    def __init__(self, config):
-       self.detection = config['detection']
-       self.vision = config['vision']
+       self.config = config
        self.model = None
        self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
-       logger.info(f"Загрузка модели YOLO с {self.vision['yolo_model_path']} на {self.device}")
+       logger.info(f"Загрузка модели YOLO с {self.config.yolo_model_path} на {self.device}")
        try:
-           self.model = YOLO(self.vision['yolo_model_path'])
+           self.model = YOLO(self.config.yolo_model_path)
            if hasattr(self.model, 'names'):
                logger.info(f"Классы модели: {self.model.names}")
        except Exception as e:
@@ -23,10 +22,10 @@ class ConeDetector:
        if self.model is None:
            return []
        try:
-           results = self.model(frame, conf=self.vision['confidence_threshold'], iou=self.vision['iou_threshold'], verbose=False, device=self.device)
+           results = self.model(frame, conf=self.config.confidence_threshold, iou=self.config.iou_threshold, verbose=False, device=self.device)
            detections = []
            
-           name_to_id = {name: int(id_str) for id_str, name in self.detection['class_names'].items()}
+           name_to_id = {name: int(id_str) for id_str, name in self.config.class_names.items()}
            
            for result in results:
                if result.boxes is not None:
@@ -45,7 +44,7 @@ class ConeDetector:
                            continue
                        
                        center_x = (x1 + x2) // 2
-                       center_y = int(y1 + (y2 - y1) * self.vision['point_of_view_offset_y']) 
+                       center_y = int(y1 + (y2 - y1) * self.config.point_of_view_offset_y) 
                        
                        detections.append({
                            'bbox': (x1, y1, x2, y2),

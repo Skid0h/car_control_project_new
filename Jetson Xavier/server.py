@@ -21,12 +21,14 @@ import os
 from Code.Config_load import load_config
 from Code.Car_control import CarController
 from Code.Cone_detector import ConeDetector
+from Code.Web import start, set_frame
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
 logger = logging.getLogger(__name__)
 
 config = load_config()
 
+start()
 
 class VisionLoop:
     def __init__(self, config, detector, car, robot_state):
@@ -108,6 +110,8 @@ class VisionLoop:
                 else:
                     image_np = img_data
                     
+                set_frame(image_np)
+                
                 detections = self.detector.detect(image_np)
                 
                 blue_cones = []

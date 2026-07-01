@@ -28,7 +28,7 @@ logger = logging.getLogger(__name__)
 
 config = Config("config.jsonc")
 
-start()  #Запуск Web
+start()  # Запуск Web
 
 class VisionLoop:
     def __init__(self, config, detector, car, robot_state):
@@ -171,10 +171,6 @@ class VisionLoop:
                         mid_x = (b_x + y_x) / 2.0
                         mid_z = (b_z + y_z) / 2.0
                         waypoints_3d.append({'x': mid_x, 'z': mid_z, 'type': 'pair', 'b_cone': b_cone, 'y_cone': y_cone})
-                        if self.config.draw_detections:
-                            cv2.line(image_np, b_cone['center'], y_cone['center'], 
-                                    self.config.pair_line_color, 
-                                    self.config.pair_line_thickness)
                         pairs_found_count += 1
 
                 if pairs_found_count == 0:
@@ -222,6 +218,34 @@ class VisionLoop:
                                       self.config.target_cross_size, 
                                       self.config.target_cross_thickness)
 
+                # ОТРИСОВКА КОНУСОВ (draw_detections) 
+                if self.config.draw_detections:
+                    for det in detections:
+                        x1, y1, x2, y2 = det['bbox']
+                        cone_name = det.get('name', '')
+                        
+                        if cone_name in self.config.blue_cones:
+                            color = (255, 0, 0)
+                        elif cone_name in self.config.yellow_cones:
+                            color = (0, 255, 255)
+                        elif cone_name in self.config.orange_cones:
+                            color = (0, 165, 255)
+                        else:
+                            color = (255, 255, 255)
+                        
+                        cv2.rectangle(image_np, (x1, y1), (x2, y2), color, 2)
+                        cv2.putText(image_np, cone_name, (x1, y1-10), 
+                                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+
+                # ЛИНИИ МЕЖДУ ПАРАМИ 
+                if self.config.pair_line_color and pairs_found_count > 0:
+                    for wp in waypoints_3d:
+                        if wp.get('type') == 'pair':
+                            cv2.line(image_np, wp['b_cone']['center'], wp['y_cone']['center'], 
+                                    self.config.pair_line_color, 
+                                    self.config.pair_line_thickness)
+
+                # УПРАВЛЕНИЕ 
                 if self.robot_state.get('auto_mode', False):
                     if target_detected:
                         self.robot_state['auto_mode'] = False
@@ -233,6 +257,7 @@ class VisionLoop:
                         steering = max(-1.0, min(1.0, error * 2.0))
                         self.car.update(1.0, steering)
 
+                # FPS 
                 fps_counter += 1
                 if time.time() - fps_last_time >= self.config.fps_update_interval:
                     current_fps = fps_counter
@@ -247,6 +272,7 @@ class VisionLoop:
                     cv2.putText(image_np, f"Target Z: {target_z:.2f}m", (10, 85), cv2.FONT_HERSHEY_SIMPLEX, 
                                self.config.target_z_text_scale, self.config.target_z_text_color, self.config.target_z_text_thickness)
                 
+                # ЗАПИСЬ 
                 if self.is_recording:
                     if self.config.draw_rec:
                         cv2.putText(image_np, "REC", (10, 55), cv2.FONT_HERSHEY_SIMPLEX, 
@@ -265,6 +291,7 @@ class VisionLoop:
                         video_writer = None
                         threading.Thread(target=self._convert_video, args=(temp_video_path, final_video_path, self.config.zed_fps)).start()
 
+                # ОТПРАВКА НА WEB
                 set_frame(image_np)
 
         if video_writer is not None:

@@ -1,27 +1,8 @@
 Записи для датасета:
-https://disk.yandex.ru/d/KPFzdMmFzrjZXA
+https://disk.yandex.ru/d/zaQ-M5_7VyRwcw
 
-Записи для датасета 2:
-https://disk.yandex.ru/d/gYOLvdsOwaobAg
+Датасеты:
+https://disk.yandex.ru/d/4ZNPUzw4C627Sw
 
-Датасет v2:
-https://disk.yandex.ru/d/yuhDvLEtMkLzKQ
-
-Датасет v3:
-https://disk.yandex.ru/d/sClGzNLgs0-sSQ
-
-Датасеты Yolo8, Yolo11, Yolo26:
-https://disk.yandex.ru/d/y6o3viAnsxHCWg
-
-Тест датасета v3 Yolo8
-https://disk.yandex.ru/d/1vtidZV4uAhzYg
-
-Тест авто-езды 1:
-https://disk.yandex.ru/d/Aba762vZcoyRgg
-Записи авто-езды:
-https://disk.yandex.ru/d/Fih5qBe97ghx6A
-
-Тест авто-езды 2:
-https://disk.yandex.ru/d/Nv43JJ8HPmdNZQ
-Записи авто-езды:
-https://disk.yandex.ru/a/-87mVFD_Q02lsQ
+Тесты авто-езды:
+https://disk.yandex.ru/d/3ybJv-Yi6UFwUA

@@ -103,8 +103,6 @@ class VisionLoop:
                     image_np = cv2.cvtColor(img_data, cv2.COLOR_BGRA2BGR)
                 else:
                     image_np = img_data
-                    
-                set_frame(image_np)
                 
                 detections = self.detector.detect(image_np)
                 
@@ -266,6 +264,8 @@ class VisionLoop:
                         video_writer.release()
                         video_writer = None
                         threading.Thread(target=self._convert_video, args=(temp_video_path, final_video_path, self.config.zed_fps)).start()
+
+                set_frame(image_np)
 
         if video_writer is not None:
             video_writer.release()

@@ -100,6 +100,7 @@ class Config:
         self.draw_fps = disp['draw_fps']
         self.draw_target_z = disp['draw_target_z']
         self.draw_rec = disp['draw_rec']
+        self.draw_cone_quad = disp['draw_cone_quad']
         self.fps_text_scale = disp['fps_text_scale']
         self.fps_text_thickness = disp['fps_text_thickness']
         self.fps_text_color = disp['fps_text_color']

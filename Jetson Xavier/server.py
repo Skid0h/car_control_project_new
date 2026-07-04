@@ -138,63 +138,46 @@ class VisionLoop:
                         elif cone_name in self.config.orange_cones:
                             orange_cones.append(det)
  
-                # === 2 ПАРЫ КОНУСОВ → ПЛОСКОСТЬ → ТОЧКА-ЦЕЛЬ ===
-                # Сортировка по площади bbox (самые близкие — первые)
-                blue_cones.sort(key=lambda c:
-                    abs(c['bbox'][2] - c['bbox'][0]) * abs(c['bbox'][3] - c['bbox'][1]),
-                    reverse=True)
-                yellow_cones.sort(key=lambda c:
-                    abs(c['bbox'][2] - c['bbox'][0]) * abs(c['bbox'][3] - c['bbox'][1]),
-                    reverse=True)
- 
-                # Берём до 2 ближайших конусов каждого цвета
-                blue_pair = blue_cones[:2]
-                yellow_pair = yellow_cones[:2]
- 
-                # Переменные для цели
+                # === МАКСИМАЛЬНО ПРОСТОЙ АВТОПИЛОТ: ЗМЕЙКА ===
+                # Едем в середину между ближайшим синим и ближайшим жёлтым конусом
+                
+                # Сортируем по дальности Z (от ближних к дальним)
+                blue_sorted = sorted([c for c in blue_cones if 'pos_3d' in c], key=lambda c: c['pos_3d'][1])
+                yellow_sorted = sorted([c for c in yellow_cones if 'pos_3d' in c], key=lambda c: c['pos_3d'][1])
+                orange_sorted = sorted([c for c in orange_cones if 'pos_3d' in c], key=lambda c: c['pos_3d'][1])
+                
                 target_x, target_z = None, None
                 target_detected = False
- 
-                # Обработка оранжевого стоп-конуса
-                if orange_cones:
-                    closest_orange = min(orange_cones, key=lambda c: c['pos_3d'][1])
-                    o_x, o_z = closest_orange['pos_3d']
+                
+                # Стоп-конус (оранжевый)
+                if orange_sorted:
+                    o_x, o_z = orange_sorted[0]['pos_3d']
                     if o_z < self.config.stop_cone_z_threshold:
                         target_detected = True
- 
-                # Строим плоскость из пар конусов
-                if len(blue_pair) >= 1 and len(yellow_pair) >= 1:
-                    # Сортируем по Z (ближние к дальним)
-                    blue_pair.sort(key=lambda c: c['pos_3d'][1])
-                    yellow_pair.sort(key=lambda c: c['pos_3d'][1])
- 
-                    b1, b2 = blue_pair[0], blue_pair[-1]  # ближний и дальний синий
-                    y1, y2 = yellow_pair[0], yellow_pair[-1]  # ближний и дальний жёлтый
- 
-                    # Точка-цель = центр четырёхугольника (среднее всех конусов)
-                    pts_count = len(blue_pair) + len(yellow_pair)
-                    sum_x = sum(c['pos_3d'][0] for c in blue_pair) + sum(c['pos_3d'][0] for c in yellow_pair)
-                    sum_z = sum(c['pos_3d'][1] for c in blue_pair) + sum(c['pos_3d'][1] for c in yellow_pair)
-                    target_x = sum_x / pts_count
-                    target_z = sum_z / pts_count
- 
-                    # Отрисовка 4 линий четырёхугольника (если включено)
-                    if self.config.draw_cone_quad and len(blue_pair) == 2 and len(yellow_pair) == 2:
-                        # Порядок: ближний синий → ближний жёлтый → дальний жёлтый → дальний синий → замкнуть
-                        pts_2d = [b1['center'], y1['center'], y2['center'], b2['center']]
-                        pts_arr = np.array(pts_2d, np.int32).reshape((-1, 1, 2))
-                        cv2.polylines(image_np, [pts_arr], isClosed=True,
-                                     color=self.config.trajectory_color,
-                                     thickness=self.config.trajectory_thickness)
- 
+                
+                # Цель = середина между ближайшим синим и ближайшим жёлтым
+                if blue_sorted and yellow_sorted:
+                    bx, bz = blue_sorted[0]['pos_3d']
+                    yx, yz = yellow_sorted[0]['pos_3d']
+                    target_x = (bx + yx) / 2.0
+                    target_z = (bz + yz) / 2.0
+                
                 # Отрисовка цели
                 if target_x is not None and self.config.draw_target:
-                    target_u = int((target_x * self.fx / target_z) + self.cx_cam)
+                    target_u = int((target_x * self.fx / max(target_z, 0.01)) + self.cx_cam)
                     target_v = int(image_np.shape[0] * self.config.cone_base_v)
                     cv2.drawMarker(image_np, (target_u, target_v), (0, 0, 255),
                                   cv2.MARKER_CROSS,
                                   self.config.target_cross_size,
                                   self.config.target_cross_thickness)
+                    cv2.putText(image_np, f"Target Z: {target_z:.2f}m", (10, 85), cv2.FONT_HERSHEY_SIMPLEX,
+                               self.config.target_z_text_scale, self.config.target_z_text_color, self.config.target_z_text_thickness)
+                    # Линия между конусами пары
+                    b_u = int((bx * self.fx / max(bz, 0.01)) + self.cx_cam)
+                    b_v = int(image_np.shape[0] * self.config.cone_base_v)
+                    y_u = int((yx * self.fx / max(yz, 0.01)) + self.cx_cam)
+                    y_v = int(image_np.shape[0] * self.config.cone_base_v)
+                    cv2.line(image_np, (b_u, b_v), (y_u, y_v), self.config.trajectory_color, self.config.trajectory_thickness)
  
                 # ОТРИСОВКА КОНУСОВ (draw_detections)
                 if self.config.draw_detections:
@@ -215,7 +198,7 @@ class VisionLoop:
                         cv2.putText(image_np, cone_name, (x1, y1-10),
                                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
  
-                # УПРАВЛЕНИЕ (простое P-регулирование)
+                # УПРАВЛЕНИЕ
                 if self.robot_state.get('auto_mode', False):
                     if target_detected:
                         self.robot_state['auto_mode'] = False
@@ -225,10 +208,11 @@ class VisionLoop:
                     elif target_x is not None:
                         # Угол до цели
                         error = math.atan2(target_x, max(target_z, 0.01))
-                        steering = max(-1.0, min(1.0, error * 2.0))
-                        self.car.update(1.0, steering)
+                        steering = max(-1.0, min(1.0, error * 1.5))
+                        self.car.update(1.0, steering)  # скорость не трогаем
                     else:
-                        self.car.stop()
+                        # Нет конусов — едем прямо
+                        self.car.update(1.0, 0.0)
  
                 # FPS
                 fps_counter += 1
@@ -241,9 +225,7 @@ class VisionLoop:
                     cv2.putText(image_np, f"FPS: {current_fps} Mode: {'AUTO' if self.robot_state.get('auto_mode') else 'MANUAL'}",
                                (10, 30), cv2.FONT_HERSHEY_SIMPLEX,
                                self.config.fps_text_scale, self.config.fps_text_color, self.config.fps_text_thickness)
-                if target_x is not None and self.config.draw_target_z:
-                    cv2.putText(image_np, f"Target Z: {target_z:.2f}m", (10, 85), cv2.FONT_HERSHEY_SIMPLEX,
-                               self.config.target_z_text_scale, self.config.target_z_text_color, self.config.target_z_text_thickness)
+
  
                 # ЗАПИСЬ
                 if self.is_recording:

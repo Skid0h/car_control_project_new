@@ -37,6 +37,17 @@ class Config:
         self.watchdog_timeout = car['watchdog_timeout']
         self.steering_range = car['steering_range']
         
+        # PID
+        pid = cfg['pid']
+        self.kp_gain = pid['kp_gain']
+        self.ki_gain = pid['ki_gain']
+        self.kd_gain = pid['kd_gain']
+        self.max_integral = pid['max_integral']
+        self.ema_alpha = pid['ema_alpha']
+        self.error_decay_rate = pid['error_decay_rate']
+        self.max_steering_output = pid['max_steering_output']
+        self.min_dt = pid['min_dt']
+        
         # Autopilot
         ap = cfg['autopilot']
         self.max_depth = ap['max_depth']
@@ -45,6 +56,9 @@ class Config:
         self.pair_z_tolerance = ap['pair_z_tolerance']
         self.pair_x_tolerance_multiplier = ap['pair_x_tolerance_multiplier']
         self.area_depth_constant = ap['area_depth_constant']
+        self.lookahead_distance = ap['lookahead_distance']
+        self.virtual_point_offset = ap['virtual_point_offset']
+        self.stop_cone_z_threshold = ap['stop_cone_z_threshold']
         
         # Vision
         vis = cfg['vision']
@@ -60,12 +74,17 @@ class Config:
         self.cone_base_v = vis['cone_base_v']
         self.target_cross_size = vis['target_cross_size']
         self.target_cross_thickness = vis['target_cross_thickness']
+        self.target_fps = vis['target_fps']
+        self.depth_mode = vis['depth_mode']
+        self.point_of_view_offset_y = vis['point_of_view_offset_y']
         
         # Detection
         det = cfg['detection']
         self.blue_cones = det['blue_cones']
         self.yellow_cones = det['yellow_cones']
         self.orange_cones = det['orange_cones']
+        self.class_names = det['class_names']
+        self.cone_colors = det['cone_colors']
         
         # Display
         disp = cfg['display']
@@ -74,6 +93,7 @@ class Config:
         self.draw_target = disp['draw_target']
         self.draw_fps = disp['draw_fps']
         self.draw_rec = disp['draw_rec']
+        self.draw_target_z = disp['draw_target_z']
         self.draw_cone_quad = disp['draw_cone_quad']
         self.fps_text_scale = disp['fps_text_scale']
         self.fps_text_thickness = disp['fps_text_thickness']
@@ -81,6 +101,14 @@ class Config:
         self.rec_text_scale = disp['rec_text_scale']
         self.rec_text_thickness = disp['rec_text_thickness']
         self.rec_text_color = disp['rec_text_color']
+        self.z_text_scale = disp['z_text_scale']
+        self.z_text_thickness = disp['z_text_thickness']
+        self.z_text_color = disp['z_text_color']
+        self.target_z_text_scale = disp['target_z_text_scale']
+        self.target_z_text_thickness = disp['target_z_text_thickness']
+        self.target_z_text_color = disp['target_z_text_color']
+        self.trajectory_thickness = disp['trajectory_thickness']
+        self.trajectory_color = disp['trajectory_color']
         
         # Video
         vid = cfg['video']
@@ -99,6 +127,9 @@ class Config:
         self.vision_thread_join_timeout = tim['vision_thread_join_timeout']
         self.message_clear_timeout = tim['message_clear_timeout']
         self.socket_timeout = tim['socket_timeout']
+        self.arduino_init_delay = tim['arduino_init_delay']
+        self.arduino_post_stop_delay = tim['arduino_post_stop_delay']
+        self.arduino_close_delay = tim['arduino_close_delay']
     
     def reload(self, config_path="config.jsonc"):
         """Перезагрузка конфига без перезапуска программы"""

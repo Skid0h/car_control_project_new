@@ -66,7 +66,7 @@ class ConeDetector:
         # ==========================================
         # Применяем ROI: обрезаем небо и края, где конусов точно не может быть (экономит ресурсы)
         orig_h, orig_w = frame.shape[:2]
-        crop_y1 = int(orig_h * getattr(self.config, 'roi_crop_top', 0.4))
+        crop_y1 = int(orig_h * getattr(self.config, 'roi_crop_top', 0.3))
         crop_y2 = int(orig_h * getattr(self.config, 'roi_crop_bottom', 1.0))
         cropped = frame[crop_y1:crop_y2, :]
         crop_h, crop_w = cropped.shape[:2]
@@ -164,7 +164,7 @@ class ConeDetector:
                 y2 = y1 + h
                 
                 # Восстанавливаем оригинальные Y-координаты. 
-                # Так как мы в начале отрезали 40% кадра (crop_y1), нужно прибавить эту высоту обратно.
+                # Так как мы в начале отрезали 30% кадра (crop_y1), нужно прибавить эту высоту обратно.
                 orig_y1 = y1 + crop_y1
                 orig_y2 = y2 + crop_y1
                 

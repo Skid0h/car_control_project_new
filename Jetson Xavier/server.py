@@ -155,13 +155,6 @@ class VisionLoop:
                     if o_z < self.config.stop_cone_z_threshold:
                         target_detected = True
                 
-                # Цель = середина между ближайшим синим и ближайшим жёлтым
-                if blue_sorted and yellow_sorted:
-                    bx, bz = blue_sorted[0]['pos_3d']
-                    yx, yz = yellow_sorted[0]['pos_3d']
-                    target_x = (bx + yx) / 2.0
-                    target_z = (bz + yz) / 2.0
-                
                 # Отрисовка цели
                 if target_x is not None and self.config.draw_target:
                     target_u = int((target_x * self.fx / max(target_z, 0.01)) + self.cx_cam)

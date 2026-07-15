@@ -27,6 +27,12 @@ class CarController:
         self.last_command_time = 0                                      # Для watchdog
         self.last_sent_cmd     = ""                                     # Последняя отправленная строка команды
         self.arduino = None
+        
+        self.forward_speed = config.forward_speed
+        self.back_speed = config.back_speed
+        self.neutral_speed = config.neutral_speed
+        self.center_steering = config.center_steering
+        self.steering_range = config.steering_range
 
         port = find_arduino_port()
         if port is None: return
@@ -52,7 +58,7 @@ class CarController:
        
         steering_clamped = max(-1.0, min(1.0, float(steering)))
         steer_value = int(self.config.center_steering - (steering_clamped * self.config.steering_range))
-        steer_value = max(0, min(270, steer_value))
+        steer_value = max(0, min(180, steer_value))
        
         command = f"<{motor_value},{steer_value}>"
         current_time = time.time()

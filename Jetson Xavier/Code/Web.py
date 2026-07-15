@@ -5,6 +5,7 @@ import threading
 
 app = Flask(__name__)
 
+# Сюда будет записываться кадр из основного кода
 current_frame = None
 frame_lock = threading.Lock()
 
@@ -44,6 +45,7 @@ def video():
                 if current_frame is not None:
                     frame = current_frame.copy()
                 else:
+                    # Если кадра нет, показываем чёрный экран
                     frame = np.zeros((480, 640, 3), dtype=np.uint8)
             
             ret, jpeg = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
@@ -54,5 +56,6 @@ def video():
     return Response(generate(), mimetype='multipart/x-mixed-replace; boundary=frame')
 
 def start():
+    """Запуск веб-сервера в отдельном потоке"""
     threading.Thread(target=lambda: app.run(host='0.0.0.0', port=5000, threaded=True), daemon=True).start()
     print("Web server started on port 5000")

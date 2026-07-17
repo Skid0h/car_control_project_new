@@ -9,6 +9,7 @@ class ConeDetector:
        self.config = config
        self.model = None
        self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
+       self.class_id_to_name = {int(class_id): name for class_id, name in self.config.class_names.items()}
        logger.info(f"Загрузка модели YOLO с {self.config.yolo_model_path} на {self.device}")
        try:
            self.model = YOLO(self.config.yolo_model_path)
@@ -24,8 +25,6 @@ class ConeDetector:
        try:
            results = self.model(frame, conf=self.config.confidence_threshold, iou=self.config.iou_threshold, verbose=False, device=self.device)
            detections = []
-           
-           name_to_id = {name: int(id_str) for id_str, name in self.config.class_names.items()}
            
            for result in results:
                if result.boxes is not None:

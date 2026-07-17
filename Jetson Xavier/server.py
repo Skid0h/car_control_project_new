@@ -48,6 +48,8 @@ class VisionLoop:
         self.last_target_x = None
         self.last_target_z = None
         self.last_target_detected = False
+        self.stop_sequence_active = False
+        self.stop_sequence_started_at = 0.0
        
         if not os.path.exists(self.config.output_folder):
             os.makedirs(self.config.output_folder)
@@ -258,12 +260,23 @@ class VisionLoop:
                     waypoints_3d.sort(key=lambda wp: wp['z'])
 
                     target_detected = False
+                    orange_stop_triggered = False
+                    orange_close_distance = None
                     if orange_cones:
                         closest_orange = min(orange_cones, key=lambda c: c['pos_3d'][1])
                         o_x, o_z = closest_orange['pos_3d']
-                        waypoints_3d.append({'x': o_x, 'z': o_z, 'type': 'stop'})
-                        if o_z < self.config.stop_cone_z_threshold: 
+                        orange_close_distance = o_z
+
+                        if o_z <= 2.5:
                             target_detected = True
+                            target_x = o_x
+                            target_z = o_z
+                            waypoints_3d = [{'x': o_x, 'z': o_z, 'type': 'stop'}]
+                        else:
+                            waypoints_3d.append({'x': o_x, 'z': o_z, 'type': 'stop'})
+
+                        if o_z <= 0.5:
+                            orange_stop_triggered = True
 
                     if self.config.draw_trajectory and should_process:
                         pts_2d = [[image_np.shape[1]//2, image_np.shape[0]]]
@@ -277,11 +290,11 @@ class VisionLoop:
                                          color=self.config.trajectory_color, 
                                          thickness=self.config.trajectory_thickness)
 
-                    target_x, target_z = None, None
-                    if len(waypoints_3d) > 0:
+                    if target_x is None and target_z is None and len(waypoints_3d) > 0:
                         target_x = waypoints_3d[0]['x']
                         target_z = waypoints_3d[0]['z']
-                        
+
+                    if len(waypoints_3d) > 0:
                         if self.config.draw_target:
                             target_u = int((target_x * self.fx / target_z) + self.cx_cam)
                             target_v = int(image_np.shape[0] * self.config.cone_base_v)
@@ -319,11 +332,21 @@ class VisionLoop:
 
                     # УПРАВЛЕНИЕ 
                     if self.robot_state.get('auto_mode', False):
-                        if target_detected:
+                        if orange_stop_triggered:
                             self.robot_state['auto_mode'] = False
                             self.robot_state['msg'] = "ФИНИШ! ОРАНЖЕВЫЙ КОНУС."
                             self.robot_state['msg_time'] = time.time()
                             self.car.stop()
+                            self.car.update(-1.0, 0.0)
+                            time.sleep(0.3)
+                            self.car.stop()
+                        elif target_detected and orange_close_distance is not None and orange_close_distance <= 2.5:
+                            if target_x is not None and target_z is not None and target_z > 0.1:
+                                error = math.atan2(target_x, target_z)
+                                steering = max(-1.0, min(1.0, error * 1.2))
+                                self.car.update(0.7, steering)
+                            else:
+                                self.car.update(0.5, 0.0)
                         elif target_x is not None:
                             error = math.atan2(target_x, target_z)
                             steering = max(-1.0, min(1.0, error * 2.0))

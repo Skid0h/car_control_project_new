@@ -56,7 +56,14 @@ class CarController:
        
         command = f"<{motor_value},{steer_value}>"
         current_time = time.time()
-        if command != self.last_sent_cmd or (current_time - self.last_sent_time) > self.config.command_interval:
+        should_send = False
+
+        if self.last_sent_cmd != command:
+            should_send = True
+        elif (current_time - self.last_sent_time) > self.config.command_interval:
+            should_send = True
+
+        if should_send:
             with self.lock:
                 try:
                     self.arduino.write(command.encode('utf-8'))

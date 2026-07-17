@@ -299,15 +299,20 @@ class VisionLoop:
         self.zed.close()
         self.robot_state['cam_connected'] = False
 
-    def start_recording(self):
-        self.is_recording = True
-
-    def stop_recording(self):
-        self.is_recording = False
-
     def close(self):
         self.running = False
         self.vision_thread.join(timeout=self.config.vision_thread_join_timeout)
+
+    def restart(self):
+        """Перезагрузка камеры"""
+        self.close()
+        time.sleep(0.5)
+        self.running = True
+        self.is_recording = False
+        self.fx = 0
+        self.cx_cam = 0
+        self.vision_thread = threading.Thread(target=self._vision_loop, daemon=True)
+        self.vision_thread.start()
 
 
 def main():
@@ -320,7 +325,8 @@ def main():
     
     detector = ConeDetector(config)
     car = CarController(config)
-    robot_state = {'auto_mode': False, 'cam_connected': False, 'msg': '', 'msg_time': 0}
+    robot_state = {'auto_mode': False, 'cam_connected': False, 'arduino_connected': False, 'msg': '', 'msg_time': 0}
+    robot_state['arduino_connected'] = car.arduino is not None
     loop = VisionLoop(config, detector, car, robot_state)
     running = True
     
@@ -341,9 +347,37 @@ def main():
                         robot_state['auto_mode'] = False
                         car.stop()
                 elif command == "R":
-                    loop.start_recording()
+                    loop.is_recording = True
                 elif command == "C":
-                    loop.stop_recording()
+                    loop.is_recording = False
+                elif command == "F":
+                    # ПЕРЕЗАГРУЗКА: отключение и повторное включение системы
+                    robot_state['auto_mode'] = False
+                    robot_state['msg'] = 'ПЕРЕЗАГРУЗКА...'
+                    robot_state['msg_time'] = time.time()
+                    logger.info("Инициирована перезагрузка системы...")
+                    
+                    # Отключение Arduino
+                    car.close()
+                    time.sleep(0.5)
+                    
+                    # Отключение камеры
+                    loop.close()
+                    time.sleep(0.5)
+                    
+                    # Повторное включение Arduino
+                    car.restart()
+                    time.sleep(0.5)
+                    
+                    # Повторное включение камеры
+                    loop.restart()
+                    time.sleep(1.0)
+                    
+                    # Обновляем статусы подключения
+                    robot_state['arduino_connected'] = car.arduino is not None
+                    robot_state['msg'] = 'СИСТЕМА ПЕРЕЗАГРУЖЕНА!'
+                    robot_state['msg_time'] = time.time()
+                    logger.info("Система успешно перезагружена!")
                 elif command.startswith("speed:"):
                     try:
                         fwd, bck = map(int, command[6:].split(','))
@@ -360,12 +394,17 @@ def main():
 
                 if time.time() - robot_state['msg_time'] > config.message_clear_timeout:
                     robot_state['msg'] = ''
+                
+                # Обновляем статус подключения Arduino
+                robot_state['arduino_connected'] = car.arduino is not None
+                
                 telemetry = {
                     "mode": "AUTO" if robot_state['auto_mode'] else "MANUAL",
                     "rec": loop.is_recording,
                     "cam_connected": robot_state['cam_connected'],
-                    "fwd": car.forward_speed,
-                    "bck": car.back_speed,
+                    "arduino_connected": robot_state['arduino_connected'],
+                    "fwd": car.config.forward_speed,
+                    "bck": car.config.back_speed,
                     "msg": robot_state['msg']
                 }
                 sock.sendto(json.dumps(telemetry).encode('utf-8'), addr)

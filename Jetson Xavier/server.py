@@ -90,10 +90,36 @@ class VisionLoop:
         video_writer = None
         temp_video_path = None
         final_video_path = None
+        
+        grab_error_count = 0
+        max_grab_errors = 10
 
         logger.info(f"Обычный автопилот: Оценка глубины по площади + Блокировка виртуальных точек.")
 
         while self.running:
+            try:
+                grab_result = self.zed.grab(runtime_params)
+                
+                if grab_result != sl.ERROR_CODE.SUCCESS:
+                    grab_error_count += 1
+                    
+                    if grab_error_count >= max_grab_errors:
+                        logger.error("Ошибка захвата кадра. Переподключение камеры...")
+                        self.robot_state['cam_connected'] = False
+                        self._reconnect_camera(init_params)
+                        grab_error_count = 0
+                        continue
+                    
+                    time.sleep(0.1)
+                    continue
+                
+                grab_error_count = 0
+            except Exception as e:
+                logger.error(f"Исключение при grab(): {e}")
+                self.robot_state['cam_connected'] = False
+                time.sleep(0.5)
+                continue
+
             if self.zed.grab(runtime_params) == sl.ERROR_CODE.SUCCESS:
 
                 self.zed.retrieve_image(image_zed, sl.VIEW.LEFT)
@@ -298,6 +324,27 @@ class VisionLoop:
             video_writer.release()
         self.zed.close()
         self.robot_state['cam_connected'] = False
+    
+    def _reconnect_camera(self, init_params):
+        """Попытка переподключения к камере"""
+        try:
+            self.zed.close()
+            time.sleep(0.5)
+        except Exception as e:
+            pass
+        
+        try:
+            self.zed = sl.Camera()
+            if self.zed.open(init_params) == sl.ERROR_CODE.SUCCESS:
+                self.robot_state['cam_connected'] = True
+                cam_info = self.zed.get_camera_information()
+                self.fx = cam_info.camera_configuration.calibration_parameters.left_cam.fx
+                self.cx_cam = cam_info.camera_configuration.calibration_parameters.left_cam.cx
+            else:
+                self.robot_state['cam_connected'] = False
+        except Exception as e:
+            logger.error(f"Ошибка переподключения камеры: {e}")
+            self.robot_state['cam_connected'] = False
 
     def close(self):
         self.running = False
@@ -338,11 +385,13 @@ def main():
     robot_state['arduino_connected'] = car.arduino is not None
     loop = VisionLoop(config, detector, car, robot_state)
     running = True
+    last_addr = None
     
     try:
         while running:
             try:
                 data, addr = sock.recvfrom(1024)
+                last_addr = addr
                 command = data.decode('utf-8').strip()
                 if command == "Q":
                     running = False
@@ -418,7 +467,8 @@ def main():
                     "bck": car.config.back_speed,
                     "msg": robot_state['msg']
                 }
-                sock.sendto(json.dumps(telemetry).encode('utf-8'), addr)
+                if last_addr:
+                    sock.sendto(json.dumps(telemetry).encode('utf-8'), last_addr)
             except socket.timeout:
                 if not robot_state['auto_mode']:
                     car.check_stop()

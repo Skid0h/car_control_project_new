@@ -27,12 +27,6 @@ class CarController:
         self.last_command_time = 0                                      # Для watchdog
         self.last_sent_cmd     = ""                                     # Последняя отправленная строка команды
         self.arduino = None
-        
-        self.forward_speed = config.forward_speed
-        self.back_speed = config.back_speed
-        self.neutral_speed = config.neutral_speed
-        self.center_steering = config.center_steering
-        self.steering_range = config.steering_range
 
         port = find_arduino_port()
         if port is None: return
@@ -88,3 +82,19 @@ class CarController:
         self.stop()
         time.sleep(self.config.arduino_close_delay)
         if self.arduino: self.arduino.close()
+    
+    def restart(self):
+        """Перезагрузка подключения Arduino"""
+        self.close()
+        time.sleep(0.5)
+        port = find_arduino_port()
+        if port is None: 
+            self.arduino = None
+            return
+        try:
+            self.arduino = serial.Serial(port, self.config.baud_rate, timeout=1)
+            time.sleep(self.config.arduino_init_delay)
+            self.stop()
+            time.sleep(self.config.arduino_post_stop_delay)
+        except Exception as e:
+            self.arduino = None

@@ -100,7 +100,7 @@ class VisionLoop:
         final_video_path = None
         
         grab_error_count = 0
-        max_grab_errors = 3
+        max_grab_errors = 5
 
         logger.info(f"Обычный автопилот: Оценка глубины по площади + Блокировка виртуальных точек.")
 
@@ -146,6 +146,11 @@ class VisionLoop:
                         new_w = max(320, int(image_np.shape[1] * scale))
                         new_h = max(180, int(image_np.shape[0] * scale))
                         detect_frame = cv2.resize(image_np, (new_w, new_h), interpolation=cv2.INTER_AREA)
+
+                crop_top = int(detect_frame.shape[0] * 0.20)
+                crop_bottom = int(detect_frame.shape[0] * 0.20)
+                if crop_top > 0 or crop_bottom > 0:
+                    detect_frame = detect_frame[crop_top:detect_frame.shape[0] - crop_bottom, :]
 
                 self.frame_counter += 1
                 should_process = (self.frame_counter % self.process_every) == 0

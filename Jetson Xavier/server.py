@@ -139,12 +139,14 @@ class VisionLoop:
 
                 detect_frame = image_np
                 if image_np.shape[1] > 640 or image_np.shape[0] > 480:
-                    scale = min(1.0, 640.0 / image_np.shape[1], 480.0 / image_np.shape[0])
+                    target_width = 480
+                    target_height = 270
+                    scale = min(1.0, target_width / image_np.shape[1], target_height / image_np.shape[0])
                     if scale < 1.0:
                         new_w = max(320, int(image_np.shape[1] * scale))
-                        new_h = max(240, int(image_np.shape[0] * scale))
+                        new_h = max(180, int(image_np.shape[0] * scale))
                         detect_frame = cv2.resize(image_np, (new_w, new_h), interpolation=cv2.INTER_AREA)
-                
+
                 self.frame_counter += 1
                 should_process = (self.frame_counter % self.process_every) == 0
 
@@ -170,7 +172,7 @@ class VisionLoop:
                             center = det.get('center')
                             if center is not None:
                                 det['center'] = (int(center[0] * scale_x), int(center[1] * scale_y))
-                    
+
                     blue_cones = []
                     yellow_cones = []
                     orange_cones = []

@@ -23,36 +23,41 @@ class ConeDetector:
        if self.model is None:
            return []
        try:
-           results = self.model(frame, conf=self.config.confidence_threshold, iou=self.config.iou_threshold, verbose=False, device=self.device)
+           with torch.inference_mode():
+               results = self.model(
+                   frame,
+                   conf=self.config.confidence_threshold,
+                   iou=self.config.iou_threshold,
+                   verbose=False,
+                   device=self.device,
+               )
+
            detections = []
-           
+
            for result in results:
-               if result.boxes is not None:
-                   for box in result.boxes:
-                       x1, y1, x2, y2 = map(int, box.xyxy[0])
-                       conf = float(box.conf[0])
-                       cls_id = int(box.cls[0])
-                       
-                       cone_name = None
-                       for name, cid in name_to_id.items():
-                           if cid == cls_id:
-                               cone_name = name
-                               break
-                       
-                       if cone_name is None:
-                           continue
-                       
-                       center_x = (x1 + x2) // 2
-                       center_y = int(y1 + (y2 - y1) * self.config.point_of_view_offset_y) 
-                       
-                       detections.append({
-                           'bbox': (x1, y1, x2, y2),
-                           'conf': conf,
-                           'class': cls_id,
-                           'name': cone_name,
-                           'center': (center_x, center_y)
-                       })
+               if result.boxes is None:
+                   continue
+
+               for box in result.boxes:
+                   x1, y1, x2, y2 = map(int, box.xyxy[0])
+                   conf = float(box.conf[0])
+                   cls_id = int(box.cls[0])
+                   cone_name = self.class_id_to_name.get(cls_id)
+
+                   if cone_name is None:
+                       continue
+
+                   center_x = (x1 + x2) // 2
+                   center_y = max(0, int(y1 + (y2 - y1) * self.config.point_of_view_offset_y))
+
+                   detections.append({
+                       'bbox': (x1, y1, x2, y2),
+                       'conf': conf,
+                       'class': cls_id,
+                       'name': cone_name,
+                       'center': (center_x, center_y)
+                   })
            return detections
        except Exception as e:
-           logger.error(f"Ошибка детекции: {e}")
+           logger.debug(f"Ошибка детекции: {e}")
            return []

@@ -301,7 +301,15 @@ class VisionLoop:
 
     def close(self):
         self.running = False
-        self.vision_thread.join(timeout=self.config.vision_thread_join_timeout)
+        self.robot_state['cam_connected'] = False
+        try:
+            if getattr(self, 'zed', None) is not None:
+                self.zed.close()
+        except Exception:
+            pass
+        if getattr(self, 'vision_thread', None) is not None and self.vision_thread.is_alive():
+            self.vision_thread.join(timeout=self.config.vision_thread_join_timeout)
+        self.zed = None
 
     def restart(self):
         """Перезагрузка камеры"""
@@ -311,6 +319,7 @@ class VisionLoop:
         self.is_recording = False
         self.fx = 0
         self.cx_cam = 0
+        self.zed = sl.Camera()
         self.vision_thread = threading.Thread(target=self._vision_loop, daemon=True)
         self.vision_thread.start()
 
@@ -370,10 +379,12 @@ def main():
                     time.sleep(0.5)
                     
                     # Повторное включение камеры
+                    robot_state['cam_connected'] = False
                     loop.restart()
                     time.sleep(1.0)
                     
                     # Обновляем статусы подключения
+                    robot_state['cam_connected'] = loop.robot_state.get('cam_connected', False)
                     robot_state['arduino_connected'] = car.arduino is not None
                     robot_state['msg'] = 'СИСТЕМА ПЕРЕЗАГРУЖЕНА!'
                     robot_state['msg_time'] = time.time()

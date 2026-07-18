@@ -90,7 +90,8 @@ class VisionLoop:
 
         runtime_params = sl.RuntimeParameters()
         image_zed = sl.Mat()
-        
+        depth_map = sl.Mat()
+                
         fps_counter = 0
         current_fps = 0
         fps_last_time = time.time()
@@ -182,16 +183,26 @@ class VisionLoop:
                     yellow_cones = []
                     orange_cones = []
                     
+                    self.zed.retrieve_measure(depth_map, sl.MEASURE.DEPTH)
+                    depth_np = depth_map.get_data()
+                    img_h, img_w = depth_np.shape[:2]
+
                     for det in detections:
                         x1, y1, x2, y2 = det['bbox']
-                        width = max(x2 - x1, 1)
-                        height = max(y2 - y1, 1)
-                        area = width * height
-                        
-                        z = self.config.area_depth_constant / math.sqrt(area)
-                        
+                        u, v = det['center']
+                        offsets = [0, max(1, (x2 - x1) // 6), -max(1, (x2 - x1) // 6)]
+                        depths = []
+                        for dx in offsets:
+                            px = max(0, min(img_w - 1, u + dx))
+                            py = max(0, min(img_h - 1, v))
+                            d = float(depth_np[py, px])
+                            if np.isfinite(d) and self.config.min_depth < d <= self.config.max_depth:
+                                depths.append(d)
+                        if not depths:
+                            continue
+                        z = sum(depths) / len(depths)
+
                         if self.config.min_depth < z <= self.config.max_depth:
-                            u, v = det['center']
                             x_cam = (u - self.cx_cam) * z / self.fx
                             det['pos_3d'] = (x_cam, z)
                             
@@ -324,6 +335,7 @@ class VisionLoop:
                             self.robot_state['msg'] = "ФИНИШ! ОРАНЖЕВЫЙ КОНУС."
                             self.robot_state['msg_time'] = time.time()
                             self.car.stop()
+                            time.sleep(0.2)
                             self.car.update(-1.0, 0.0)
                             time.sleep(0.3)
                             self.car.stop()

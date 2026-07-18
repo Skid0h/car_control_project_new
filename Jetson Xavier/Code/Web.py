@@ -5,8 +5,9 @@ import threading
 
 app = Flask(__name__)
 
-current_frame = None
+current_jpeg = None
 frame_lock = threading.Lock()
+frame_event = threading.Event()
 
 HTML = """
 <!DOCTYPE html>
@@ -27,10 +28,16 @@ HTML = """
 
 def set_frame(frame):
     """Основной код вызывает эту функцию чтобы обновить кадр"""
-    global current_frame
+    global current_jpeg
+    if frame is None:
+        return
+    ret, jpeg = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 70])
+    if not ret:
+        return
+    jpeg_bytes = jpeg.tobytes()
     with frame_lock:
-        if frame is not None:
-            current_frame = frame.copy()
+        current_jpeg = jpeg_bytes
+    frame_event.set()
 
 @app.route('/')
 def index():
@@ -40,17 +47,13 @@ def index():
 def video():
     def generate():
         while True:
+            frame_event.wait(timeout=1.0)
+            frame_event.clear()
             with frame_lock:
-                if current_frame is not None:
-                    frame = current_frame.copy()
-                else:
-                    frame = np.zeros((480, 640, 3), dtype=np.uint8)
-            
-            ret, jpeg = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
-            if ret:
-                yield (b'--frame\r\n'
-                       b'Content-Type: image/jpeg\r\n\r\n' + jpeg.tobytes() + b'\r\n')
-    
+                jpeg_bytes = current_jpeg
+            if jpeg_bytes is None:
+                continue
+            yield (b'--frame\r\nContent-Type: image/jpeg\r\n\r\n' + jpeg_bytes + b'\r\n')
     return Response(generate(), mimetype='multipart/x-mixed-replace; boundary=frame')
 
 def start():

@@ -17,6 +17,12 @@ import pyzed.sl as sl
 import threading
 import numpy as np
 import os
+import queue
+
+try:
+    CUDA_AVAILABLE = cv2.cuda.getCudaEnabledDeviceCount() > 0
+except:
+    CUDA_AVAILABLE = False
 
 from Code.Config_load import Config
 from Code.Car_control import CarController
@@ -54,9 +60,50 @@ class VisionLoop:
        
         self.fx = 0
         self.cx_cam = 0
-        
+
+        self.rec_queue = queue.Queue(maxsize=30)
+        self.rec_thread = threading.Thread(target=self._rec_loop, daemon=True)
+        self.rec_thread.start()
+
         self.vision_thread = threading.Thread(target=self._vision_loop, daemon=True)
         self.vision_thread.start()
+
+    def _rec_loop(self):
+        video_writer = None
+        temp_video_path = None
+        final_video_path = None
+        rec_frame_count = 0
+        rec_start_time = None
+
+        while self.running:
+            try:
+                item = self.rec_queue.get(timeout=0.5)
+            except queue.Empty:
+                continue
+
+            if item is None:
+                if video_writer is not None:
+                    video_writer.release()
+                    video_writer = None
+                    rec_duration = time.time() - rec_start_time
+                    real_fps = rec_frame_count / rec_duration if rec_duration > 0 else self.config.zed_fps
+                    threading.Thread(target=self._convert_video, args=(temp_video_path, final_video_path, real_fps)).start()
+                continue
+
+            frame, timestamp = item
+            if video_writer is None:
+                temp_video_path = os.path.join(self.config.output_folder, f"temp_{timestamp}.{self.config.temp_extension}")
+                final_video_path = os.path.join(self.config.output_folder, f"{self.config.output_prefix}_{timestamp}.{self.config.output_extension}")
+                h, w = frame.shape[:2]
+                fourcc = cv2.VideoWriter_fourcc(*self.config.temp_codec)
+                video_writer = cv2.VideoWriter(temp_video_path, fourcc, self.config.zed_fps, (w, h))
+                rec_frame_count = 0
+                rec_start_time = time.time()
+            video_writer.write(frame)
+            rec_frame_count += 1
+
+        if video_writer is not None:
+            video_writer.release()
 
     def _convert_video(self, input_path, output_path, fps):
         try:
@@ -90,15 +137,13 @@ class VisionLoop:
 
         runtime_params = sl.RuntimeParameters()
         image_zed = sl.Mat()
-        
+
         fps_counter = 0
         current_fps = 0
         fps_last_time = time.time()
-        
-        video_writer = None
-        temp_video_path = None
-        final_video_path = None
-        
+        rec_timestamp = None
+        was_recording = False
+
         grab_error_count = 0
         max_grab_errors = 5
 
@@ -132,7 +177,11 @@ class VisionLoop:
                 self.zed.retrieve_image(image_zed, sl.VIEW.LEFT)
                 
                 img_data = image_zed.get_data()
-                if img_data.shape[2] == 4:
+                if CUDA_AVAILABLE and img_data.shape[2] == 4:
+                    gpu_src = cv2.cuda_GpuMat()
+                    gpu_src.upload(img_data)
+                    image_np = cv2.cuda.cvtColor(gpu_src, cv2.COLOR_BGRA2BGR).download()
+                elif img_data.shape[2] == 4:
                     image_np = cv2.cvtColor(img_data, cv2.COLOR_BGRA2BGR)
                 else:
                     image_np = img_data
@@ -145,7 +194,12 @@ class VisionLoop:
                     if scale < 1.0:
                         new_w = max(320, int(image_np.shape[1] * scale))
                         new_h = max(180, int(image_np.shape[0] * scale))
-                        detect_frame = cv2.resize(image_np, (new_w, new_h), interpolation=cv2.INTER_AREA)
+                        if CUDA_AVAILABLE:
+                            gpu_img = cv2.cuda_GpuMat()
+                            gpu_img.upload(image_np)
+                            detect_frame = cv2.cuda.resize(gpu_img, (new_w, new_h)).download()
+                        else:
+                            detect_frame = cv2.resize(image_np, (new_w, new_h), interpolation=cv2.INTER_AREA)
 
                 crop_top = int(detect_frame.shape[0] * 0.20)
                 crop_bottom = int(detect_frame.shape[0] * 0.20)
@@ -193,7 +247,7 @@ class VisionLoop:
                         if self.config.min_depth < z <= self.config.max_depth:
                             u, v = det['center']
                             x_cam = (u - self.cx_cam) * z / self.fx
-                            det['pos_3d'] = (x_cam, z)
+                            det['pos_3d'] = (x_cam, z - self.config.camera_offset_z)
                             
                             if self.config.draw_target_z:
                                 cv2.putText(image_np, f"Z:{z:.1f}m", (x1, y1-25), 
@@ -248,12 +302,12 @@ class VisionLoop:
                     if pairs_found_count == 0:
                         for b_cone in blue_cones:
                             b_x, b_z = b_cone['pos_3d']
-                            waypoints_3d.append({'x': b_x + self.config.virtual_point_offset, 'z': b_z, 'type': 'virtual_blue'})
+                            waypoints_3d.append({'x': b_x + self.config.virtual_point_offset, 'z': b_z, 'type': 'virtual_blue', 'steer_k': self.config.virtual_steer_k})
                             
                         for i, y_cone in enumerate(yellow_cones):
                             if i not in used_yellows:
                                 y_x, y_z = y_cone['pos_3d']
-                                waypoints_3d.append({'x': y_x - self.config.virtual_point_offset, 'z': y_z, 'type': 'virtual_yellow'})
+                                waypoints_3d.append({'x': y_x - self.config.virtual_point_offset, 'z': y_z, 'type': 'virtual_yellow', 'steer_k': self.config.virtual_steer_k})
 
                     waypoints_3d.sort(key=lambda wp: wp['z'])
 
@@ -323,10 +377,13 @@ class VisionLoop:
                             self.robot_state['auto_mode'] = False
                             self.robot_state['msg'] = "ФИНИШ! ОРАНЖЕВЫЙ КОНУС."
                             self.robot_state['msg_time'] = time.time()
-                            self.car.stop()
+                            def _brake(car=self.car):
+                                car.stop()
+                            threading.Thread(target=_brake, daemon=True).start()
                         elif target_x is not None:
                             error = math.atan2(target_x, target_z)
-                            steering = max(-1.0, min(1.0, error * 2.0))
+                            steer_k = waypoints_3d[0].get('steer_k', 2.0)
+                            steering = max(-1.0, min(1.0, error * steer_k))
                             self.car.update(1.0, steering)
 
                     self.last_detections = detections
@@ -357,31 +414,25 @@ class VisionLoop:
                     cv2.putText(image_np, f"Target Z: {target_z:.2f}m", (10, 85), cv2.FONT_HERSHEY_SIMPLEX, 
                                self.config.target_z_text_scale, self.config.target_z_text_color, self.config.target_z_text_thickness)
                 
-                # ЗАПИСЬ 
+                # ЗАПИСЬ
                 if self.is_recording:
                     if self.config.draw_rec:
-                        cv2.putText(image_np, "REC", (10, 55), cv2.FONT_HERSHEY_SIMPLEX, 
+                        cv2.putText(image_np, "REC", (10, 55), cv2.FONT_HERSHEY_SIMPLEX,
                                    self.config.rec_text_scale, self.config.rec_text_color, self.config.rec_text_thickness)
-                    if video_writer is None:
-                        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                        temp_video_path = os.path.join(self.config.output_folder, f"temp_{timestamp}.{self.config.temp_extension}")
-                        final_video_path = os.path.join(self.config.output_folder, f"{self.config.output_prefix}_{timestamp}.{self.config.output_extension}")
-                        height, width = image_np.shape[:2]
-                        fourcc = cv2.VideoWriter_fourcc(*self.config.temp_codec)
-                        video_writer = cv2.VideoWriter(temp_video_path, fourcc, self.config.zed_fps, (width, height))
-                    video_writer.write(image_np)
+                    if not was_recording:
+                        rec_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                        was_recording = True
+                    if not self.rec_queue.full():
+                        self.rec_queue.put((image_np.copy(), rec_timestamp))
                 else:
-                    if video_writer is not None:
-                        video_writer.release()
-                        video_writer = None
-                        threading.Thread(target=self._convert_video, args=(temp_video_path, final_video_path, self.config.zed_fps)).start()
+                    if was_recording:
+                        self.rec_queue.put(None)
+                        was_recording = False
 
                 # ОТПРАВКА НА WEB
                 if self.frame_counter % self.publish_every == 0:
                     set_frame(image_np)
 
-        if video_writer is not None:
-            video_writer.release()
         self.zed.close()
         self.robot_state['cam_connected'] = False
     
@@ -416,10 +467,12 @@ class VisionLoop:
             pass
         if getattr(self, 'vision_thread', None) is not None and self.vision_thread.is_alive():
             self.vision_thread.join(timeout=self.config.vision_thread_join_timeout)
+        if getattr(self, 'rec_thread', None) is not None and self.rec_thread.is_alive():
+            self.rec_queue.put(None)
+            self.rec_thread.join(timeout=3.0)
         self.zed = None
 
     def restart(self):
-        """Перезагрузка камеры"""
         self.close()
         time.sleep(0.5)
         self.running = True
@@ -427,6 +480,9 @@ class VisionLoop:
         self.fx = 0
         self.cx_cam = 0
         self.zed = sl.Camera()
+        self.rec_queue = queue.Queue(maxsize=30)
+        self.rec_thread = threading.Thread(target=self._rec_loop, daemon=True)
+        self.rec_thread.start()
         self.vision_thread = threading.Thread(target=self._vision_loop, daemon=True)
         self.vision_thread.start()
 
@@ -505,12 +561,15 @@ def main():
                     except:
                         pass
                 else:
-                    if not robot_state['auto_mode']:
-                        try:
-                            speed, steering = map(float, command.split(','))
+                    try:
+                        speed, steering = map(float, command.split(','))
+                        if robot_state['auto_mode'] and (speed != 0.0 or steering != 0.0):
+                            robot_state['auto_mode'] = False
+                            robot_state['msg_time'] = time.time()
+                        if not robot_state['auto_mode']:
                             car.update(speed, steering)
-                        except:
-                            pass
+                    except:
+                        pass
 
                 if time.time() - robot_state['msg_time'] > config.message_clear_timeout:
                     robot_state['msg'] = ''

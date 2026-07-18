@@ -57,6 +57,7 @@ class Config:
         self.pair_z_tolerance = ap['pair_z_tolerance']
         self.pair_x_tolerance_multiplier = ap['pair_x_tolerance_multiplier']
         self.virtual_point_offset = ap['virtual_point_offset']
+        self.virtual_steer_k = ap['virtual_steer_k']
         self.stop_cone_z_threshold = ap['stop_cone_z_threshold']
         self.area_depth_constant = ap['area_depth_constant']
         
@@ -68,6 +69,7 @@ class Config:
         self.target_fps = vis['target_fps']
         self.output_folder = vis['output_folder']
         self.camera_offset_x = vis['camera_offset_x']
+        self.camera_offset_z = vis['camera_offset_z']
         self.zed_resolution = vis['zed_resolution']
         self.zed_fps = vis['zed_fps']
         self.depth_mode = vis['depth_mode']

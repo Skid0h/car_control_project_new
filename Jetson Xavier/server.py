@@ -54,6 +54,7 @@ class VisionLoop:
        
         self.fx = 0
         self.cx_cam = 0
+        self._prev_depths = {}
         
         self.vision_thread = threading.Thread(target=self._vision_loop, daemon=True)
         self.vision_thread.start()
@@ -190,17 +191,25 @@ class VisionLoop:
                     for det in detections:
                         x1, y1, x2, y2 = det['bbox']
                         u, v = det['center']
-                        offsets = [0, max(1, (x2 - x1) // 6), -max(1, (x2 - x1) // 6)]
+                        cone_id = det.get('name', '') + str(x1)
+                        h = max(y2 - y1, 1)
+                        dy = max(1, h // 6)
                         depths = []
-                        for dx in offsets:
-                            px = max(0, min(img_w - 1, u + dx))
-                            py = max(0, min(img_h - 1, v))
+                        for dv in [0, dy, -dy]:
+                            px = max(0, min(img_w - 1, u))
+                            py = max(0, min(img_h - 1, v + dv))
                             d = float(depth_np[py, px])
                             if np.isfinite(d) and self.config.min_depth < d <= self.config.max_depth:
                                 depths.append(d)
                         if not depths:
                             continue
-                        z = sum(depths) / len(depths)
+                        z_new = sum(depths) / len(depths)
+                        prev = self._prev_depths.get(cone_id)
+                        if prev is not None and abs(z_new - prev) > 0.5:
+                            z = prev
+                        else:
+                            z = z_new
+                        self._prev_depths[cone_id] = z
 
                         if self.config.min_depth < z <= self.config.max_depth:
                             x_cam = (u - self.cx_cam) * z / self.fx

@@ -89,6 +89,7 @@
     "target_fps"                 : 15.0,
     "output_folder"              : "zed_recordings",        // Папка для сохранения видеозаписей
     "camera_offset_x"            : -0.06,                   // Смещение камеры по оси X относительно центра машины (метры)
+    "camera_offset_z"            : 0.15,                    // Расстояние от камеры до передней оси машины (метры). Конус реально ближе на это значение
     "zed_resolution"             : "HD720",
     "zed_fps"                    : 15,
     "depth_mode"                 : "PERFORMANCE",           // Режим глубины ZED: PERFORMANCE, QUALITY, ULTRA

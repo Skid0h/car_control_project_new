@@ -54,7 +54,6 @@ class VisionLoop:
        
         self.fx = 0
         self.cx_cam = 0
-        self._prev_depths = {}
         
         self.vision_thread = threading.Thread(target=self._vision_loop, daemon=True)
         self.vision_thread.start()
@@ -91,8 +90,7 @@ class VisionLoop:
 
         runtime_params = sl.RuntimeParameters()
         image_zed = sl.Mat()
-        depth_map = sl.Mat()
-                
+        
         fps_counter = 0
         current_fps = 0
         fps_last_time = time.time()
@@ -184,34 +182,16 @@ class VisionLoop:
                     yellow_cones = []
                     orange_cones = []
                     
-                    self.zed.retrieve_measure(depth_map, sl.MEASURE.DEPTH)
-                    depth_np = depth_map.get_data()
-                    img_h, img_w = depth_np.shape[:2]
-
                     for det in detections:
                         x1, y1, x2, y2 = det['bbox']
-                        u, v = det['center']
-                        cone_id = det.get('name', '') + str(x1)
-                        h = max(y2 - y1, 1)
-                        dy = max(1, h // 6)
-                        depths = []
-                        for dv in [0, dy, -dy]:
-                            px = max(0, min(img_w - 1, u))
-                            py = max(0, min(img_h - 1, v + dv))
-                            d = float(depth_np[py, px])
-                            if np.isfinite(d) and self.config.min_depth < d <= self.config.max_depth:
-                                depths.append(d)
-                        if not depths:
-                            continue
-                        z_new = sum(depths) / len(depths)
-                        prev = self._prev_depths.get(cone_id)
-                        if prev is not None and abs(z_new - prev) > 0.5:
-                            z = prev
-                        else:
-                            z = z_new
-                        self._prev_depths[cone_id] = z
-
+                        width = max(x2 - x1, 1)
+                        height = max(y2 - y1, 1)
+                        area = width * height
+                        
+                        z = self.config.area_depth_constant / math.sqrt(area)
+                        
                         if self.config.min_depth < z <= self.config.max_depth:
+                            u, v = det['center']
                             x_cam = (u - self.cx_cam) * z / self.fx
                             det['pos_3d'] = (x_cam, z)
                             

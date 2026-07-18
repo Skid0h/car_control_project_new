@@ -98,6 +98,8 @@ class VisionLoop:
         video_writer = None
         temp_video_path = None
         final_video_path = None
+        rec_frame_count = 0
+        rec_start_time = None
         
         grab_error_count = 0
         max_grab_errors = 5
@@ -193,7 +195,7 @@ class VisionLoop:
                         if self.config.min_depth < z <= self.config.max_depth:
                             u, v = det['center']
                             x_cam = (u - self.cx_cam) * z / self.fx
-                            det['pos_3d'] = (x_cam, z)
+                            det['pos_3d'] = (x_cam, z - self.config.camera_offset_z)
                             
                             if self.config.draw_target_z:
                                 cv2.putText(image_np, f"Z:{z:.1f}m", (x1, y1-25), 
@@ -324,7 +326,7 @@ class VisionLoop:
                             self.robot_state['msg'] = "ФИНИШ! ОРАНЖЕВЫЙ КОНУС."
                             self.robot_state['msg_time'] = time.time()
                             self.car.stop()
-                            time.sleep(0.2)
+                            time.sleep(0.4)
                             self.car.update(-1.0, 0.0)
                             time.sleep(0.3)
                             self.car.stop()
@@ -373,12 +375,17 @@ class VisionLoop:
                         height, width = image_np.shape[:2]
                         fourcc = cv2.VideoWriter_fourcc(*self.config.temp_codec)
                         video_writer = cv2.VideoWriter(temp_video_path, fourcc, self.config.zed_fps, (width, height))
+                        rec_frame_count = 0
+                        rec_start_time = time.time()
                     video_writer.write(image_np)
+                    rec_frame_count += 1
                 else:
                     if video_writer is not None:
                         video_writer.release()
                         video_writer = None
-                        threading.Thread(target=self._convert_video, args=(temp_video_path, final_video_path, self.config.zed_fps)).start()
+                        rec_duration = time.time() - rec_start_time
+                        real_fps = rec_frame_count / rec_duration if rec_duration > 0 else self.config.zed_fps
+                        threading.Thread(target=self._convert_video, args=(temp_video_path, final_video_path, real_fps)).start()
 
                 # ОТПРАВКА НА WEB
                 if self.frame_counter % self.publish_every == 0:

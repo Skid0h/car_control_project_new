@@ -68,6 +68,7 @@ class Config:
         self.target_fps = vis['target_fps']
         self.output_folder = vis['output_folder']
         self.camera_offset_x = vis['camera_offset_x']
+        self.camera_offset_z = vis['camera_offset_z']
         self.zed_resolution = vis['zed_resolution']
         self.zed_fps = vis['zed_fps']
         self.depth_mode = vis['depth_mode']

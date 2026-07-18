@@ -57,6 +57,7 @@ class Config:
         self.pair_z_tolerance = ap['pair_z_tolerance']
         self.pair_x_tolerance_multiplier = ap['pair_x_tolerance_multiplier']
         self.virtual_point_offset = ap['virtual_point_offset']
+        self.virtual_steer_k = ap['virtual_steer_k']
         self.stop_cone_z_threshold = ap['stop_cone_z_threshold']
         self.area_depth_constant = ap['area_depth_constant']
         

@@ -302,12 +302,12 @@ class VisionLoop:
                     if pairs_found_count == 0:
                         for b_cone in blue_cones:
                             b_x, b_z = b_cone['pos_3d']
-                            waypoints_3d.append({'x': b_x + self.config.virtual_point_offset, 'z': b_z, 'type': 'virtual_blue'})
+                            waypoints_3d.append({'x': b_x + self.config.virtual_point_offset, 'z': b_z, 'type': 'virtual_blue', 'steer_k': self.config.virtual_steer_k})
                             
                         for i, y_cone in enumerate(yellow_cones):
                             if i not in used_yellows:
                                 y_x, y_z = y_cone['pos_3d']
-                                waypoints_3d.append({'x': y_x - self.config.virtual_point_offset, 'z': y_z, 'type': 'virtual_yellow'})
+                                waypoints_3d.append({'x': y_x - self.config.virtual_point_offset, 'z': y_z, 'type': 'virtual_yellow', 'steer_k': self.config.virtual_steer_k})
 
                     waypoints_3d.sort(key=lambda wp: wp['z'])
 
@@ -382,7 +382,8 @@ class VisionLoop:
                             threading.Thread(target=_brake, daemon=True).start()
                         elif target_x is not None:
                             error = math.atan2(target_x, target_z)
-                            steering = max(-1.0, min(1.0, error * 2.0))
+                            steer_k = waypoints_3d[0].get('steer_k', 2.0)
+                            steering = max(-1.0, min(1.0, error * steer_k))
                             self.car.update(1.0, steering)
 
                     self.last_detections = detections
@@ -560,12 +561,15 @@ def main():
                     except:
                         pass
                 else:
-                    if not robot_state['auto_mode']:
-                        try:
-                            speed, steering = map(float, command.split(','))
+                    try:
+                        speed, steering = map(float, command.split(','))
+                        if robot_state['auto_mode'] and (speed != 0.0 or steering != 0.0):
+                            robot_state['auto_mode'] = False
+                            robot_state['msg_time'] = time.time()
+                        if not robot_state['auto_mode']:
                             car.update(speed, steering)
-                        except:
-                            pass
+                    except:
+                        pass
 
                 if time.time() - robot_state['msg_time'] > config.message_clear_timeout:
                     robot_state['msg'] = ''

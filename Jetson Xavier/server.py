@@ -1,184 +1,150 @@
-import socket          
-import time            
-import logging         
-import sys             
-import json             
-import math             
-import subprocess       
-from datetime import datetime 
-import cv2             
-import pyzed.sl as sl   
-import threading        
-import numpy as np      
-import os               
+"""
+Запускается на Jetson.
+АЛГОРИТМ: Обычный автопилот (Оценка глубины по площади + Пары + Блокировка виртуальных точек).
+ФАЙЛ КОНФИГУРАЦИИ. ПОМЕХОЗАЩИЩЕННЫЙ UART.
+"""
 
-# Импорты собственных модулей проекта
-from Code.Config_load import Config          # Загрузка настроек из jsonc
-from Code.Car_control import CarController   # Управление Arduino
-from Code.Cone_detector import ConeDetector  # Нейросеть YOLO (TensorRT)
-from Code.Web import start, set_frame        # Веб-сервер для стриминга видео
+import socket
+import time
+import logging
+import sys
+import json
+import math
+import subprocess
+from datetime import datetime
+import cv2
+import pyzed.sl as sl
+import threading
+import numpy as np
+import os
+import queue
 
-# Настройка логирования: формат вывода сообщений в консоль
+try:
+    CUDA_AVAILABLE = cv2.cuda.getCudaEnabledDeviceCount() > 0
+except:
+    CUDA_AVAILABLE = False
+
+from Code.Config_load import Config
+from Code.Car_control import CarController
+from Code.Cone_detector import ConeDetector
+from Code.Web import start, set_frame
+
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
 logger = logging.getLogger(__name__)
 
-# Загружаем настройки из конфигурационного файла
 config = Config("config.jsonc")
 
-# Запускаем веб-сервер для трансляции видео в браузер (поток запускается внутри Web.py)
-start()
+start()  # Запуск Web
 
-# ==========================================
-# ПИД-РЕГУЛЯТОР (С ДИНАМИЧЕСКИМ DT)
-# ==========================================
-# Класс для вычисления угла поворота руля на основе ошибки (отклонения машинки от трассы)
-class SimplePID:
-    def __init__(self, kp=1.5, ki=0.1, kd=0.3):
-        self.kp = kp          # Пропорциональный коэффициент (реакция на текущую ошибку)
-        self.ki = ki          # Интегральный коэффициент (реакция на накопленную ошибку)
-        self.kd = kd          # Дифференциальный коэффициент (реакция на скорость изменения ошибки, убирает раскачку)
-        self.integral = 0.0   # Накопленная ошибка за всё время
-        self.last_error = 0.0 # Ошибка на предыдущем шаге
-
-    def compute(self, error, dt):
-        """
-        Расчет управляющего воздействия на руль.
-        error: текущее отклонение (угол)
-        dt: время, прошедшее с предыдущего расчета (в секундах)
-        """
-        # Защита от деления на ноль или слишком больших скачков времени при лагах
-        if dt <= 0: 
-            dt = 0.03
-        if dt > 0.5: 
-            dt = 0.5
-            
-        # Интегральная часть: накапливаем ошибку со временем
-        self.integral += error * dt
-        # Ограничиваем интеграл, чтобы избежать эффекта "windup" (чтобы руль не "залип" в крайнем положении)
-        self.integral = max(-1.0, min(1.0, self.integral))
-        
-        # Дифференциальная часть: скорость изменения ошибки (тормозит руль, если мы быстро возвращаемся к цели)
-        derivative = (error - self.last_error) / dt
-        
-        # Общая формула ПИД
-        output = self.kp * error + self.ki * self.integral + self.kd * derivative
-        
-        # Запоминаем текущую ошибку для следующего кадра
-        self.last_error = error
-        
-        # Возвращаем значение руля строго в пределах от -1.0 до 1.0
-        return max(-1.0, min(1.0, output))
-
-    def reset(self):
-        """Сброс внутренних переменных при остановке или переходе в ручной режим"""
-        self.integral = 0.0
-        self.last_error = 0.0
-
-# ==========================================
-# ОСНОВНОЙ ЦИКЛ КОМПЬЮТЕРНОГО ЗРЕНИЯ
-# ==========================================
 class VisionLoop:
     def __init__(self, config, detector, car, robot_state):
         self.config = config
-        self.detector = detector        # Объект нейросети (TensorRT)
-        self.car = car                  # Контроллер машинки (отправка команд на Arduino)
-        self.robot_state = robot_state  # Общий словарь состояния робота (разделяемый с главным потоком)
+        self.detector = detector
+        self.car = car
+        self.robot_state = robot_state
 
-        self.zed = sl.Camera()          # Инициализация объекта камеры ZED
-        self.running = True             # Флаг работы потока (пока True — цикл крутится)
-        self.is_recording = False       # Флаг записи видео
+        self.zed = sl.Camera()
+        self.running = True
+        self.is_recording = False
+        self.frame_counter = 0
+        self.process_every = max(1, int(round(self.config.zed_fps / max(1.0, self.config.target_fps))))
+        self.publish_every = max(1, self.process_every)
+        self.last_detections = []
+        self.last_waypoints_3d = []
+        self.last_target_x = None
+        self.last_target_z = None
+        self.last_target_detected = False
+
+	# --- Добавлено для нового алгоритма нахождения пути ---
+	self.memory_cones = []
+        self.smooth_tx = 0.0
+        self.smooth_tz = self.config.lookahead_distance
        
-        # Создаем папку для сохранения видео, если ее еще нет
         if not os.path.exists(self.config.output_folder):
             os.makedirs(self.config.output_folder)
        
-        # Параметры калибровки камеры (фокусное расстояние и оптический центр)
         self.fx = 0
         self.cx_cam = 0
-        
-        # Инициализация ПИД-регулятора параметрами из конфига
-        kp = getattr(self.config, 'pid_kp', 1.5)
-        ki = getattr(self.config, 'pid_ki', 0.1)
-        kd = getattr(self.config, 'pid_kd', 0.3)
-        self.pid = SimplePID(kp=kp, ki=ki, kd=kd)
-        
-        # Память конусов: хранит конусы между кадрами, чтобы они не пропадали при одиночных пропусках детекции
-        self.memory_cones = []
-        self.last_error_angle = 0.0
-        
-        # Переменные для расчета времени (dt) между кадрами
-        self.last_frame_time = time.time()
-        
-        # Переменные для сглаживания целевой точки (Exponential Moving Average)
-        self.smooth_tx = 0.0
-        self.smooth_tz = getattr(self.config, 'lookahead_min', 0.3)
-        
-        # Запускаем цикл обработки видео в отдельном потоке (background thread)
+
+        self.rec_queue = queue.Queue(maxsize=30)
+        self.rec_thread = threading.Thread(target=self._rec_loop, daemon=True)
+        self.rec_thread.start()
+
         self.vision_thread = threading.Thread(target=self._vision_loop, daemon=True)
         self.vision_thread.start()
 
+    def _get_boundary_data(self, cones, z_targets):
+        """ДОБАВЛЕНО Интерполяция X-координат с фильтрацией выбросов"""
+        valid_cones = [c for c in cones if abs(c[0]) < 2.5]
+        
+        if not valid_cones:
+            return None, 999.0, -1.0
+            
+        z_vals = [c[1] for c in valid_cones]
+        x_vals = [c[0] for c in valid_cones]
+        min_z, max_z = min(z_vals), max(z_vals)
+        
+        if len(valid_cones) == 1:
+            bound_x = np.full_like(z_targets, x_vals[0])
+        else:
+            bound_x = np.interp(z_targets, z_vals, x_vals, left=x_vals[0], right=x_vals[-1])
+            
+        return bound_x, min_z, max_z
+
+    def _rec_loop(self):
+        video_writer = None
+        temp_video_path = None
+        final_video_path = None
+        rec_frame_count = 0
+        rec_start_time = None
+
+        while self.running:
+            try:
+                item = self.rec_queue.get(timeout=0.5)
+            except queue.Empty:
+                continue
+
+            if item is None:
+                if video_writer is not None:
+                    video_writer.release()
+                    video_writer = None
+                    rec_duration = time.time() - rec_start_time
+                    real_fps = rec_frame_count / rec_duration if rec_duration > 0 else self.config.zed_fps
+                    threading.Thread(target=self._convert_video, args=(temp_video_path, final_video_path, real_fps)).start()
+                continue
+
+            frame, timestamp = item
+            if video_writer is None:
+                temp_video_path = os.path.join(self.config.output_folder, f"temp_{timestamp}.{self.config.temp_extension}")
+                final_video_path = os.path.join(self.config.output_folder, f"{self.config.output_prefix}_{timestamp}.{self.config.output_extension}")
+                h, w = frame.shape[:2]
+                fourcc = cv2.VideoWriter_fourcc(*self.config.temp_codec)
+                video_writer = cv2.VideoWriter(temp_video_path, fourcc, self.config.zed_fps, (w, h))
+                rec_frame_count = 0
+                rec_start_time = time.time()
+            video_writer.write(frame)
+            rec_frame_count += 1
+
+        if video_writer is not None:
+            video_writer.release()
+
     def _convert_video(self, input_path, output_path, fps):
-        """Конвертация видео через FFmpeg для сильного сжатия (уменьшения размера файла)"""
         try:
             cmd = ['ffmpeg', '-i', input_path, '-r', str(fps), '-c:v', self.config.output_codec, 
                    '-preset', self.config.output_preset, '-crf', str(self.config.output_crf), 
                    '-pix_fmt', self.config.output_pix_fmt, '-y', output_path]
             subprocess.run(cmd, check=True, capture_output=True)
             logger.info(f"Видео сконвертировано: {output_path}")
-            os.remove(input_path) # Удаляем тяжелый сырой (временный) файл
+            os.remove(input_path)
+            self.robot_state['msg'] = "ВИДЕО СОХРАНЕНО!"
+            self.robot_state['msg_time'] = time.time()
         except Exception as e:
             logger.error(f"Ошибка конвертации: {e}")
 
-    def _get_robust_depth(self, depth_data, u, v, window_size=5):
-        """
-        Получение надежной глубины (дистанции) из 3D-карты глубины камеры ZED.
-        Берет окно пикселей вокруг центра конуса (u,v) и возвращает медиану (отсеивая шумы и нули).
-        """
-        h, w = depth_data.shape
-        half = window_size // 2
-        
-        # Защита от выхода за границы картинки (чтобы скрипт не упал с ошибкой индекса)
-        v_min, v_max = max(0, v - half), min(h, v + half + 1)
-        u_min, u_max = max(0, u - half), min(w, u + half + 1)
-        
-        # Вырезаем область и берем только корректные значения (глубина > 0 и не NaN)
-        roi = depth_data[v_min:v_max, u_min:u_max]
-        valid_depths = roi[np.isfinite(roi) & (roi > 0)]
-        
-        if len(valid_depths) > 0:
-            return float(np.median(valid_depths))
-        return -1.0 # Возвращаем -1, если дистанцию определить не удалось
-
-    def _get_boundary_data(self, cones, z_targets):
-        """
-        Интерполяция (построение) границы трассы по найденным конусам.
-        Возвращает массив X-координат границы для заданных Z-дальностей.
-        """
-        # Отбрасываем ошибочные срабатывания: конусы дальше 2.5 метров вбок считаем мусором
-        valid_cones = [c for c in cones if abs(c[0]) < 2.5]
-        
-        if not valid_cones:
-            return None, 999.0, -1.0
-            
-        z_vals = [c[1] for c in valid_cones] # Глубины (Z) конусов
-        x_vals = [c[0] for c in valid_cones] # Смещения (X) конусов влево/вправо
-        min_z, max_z = min(z_vals), max(z_vals)
-        
-        if len(valid_cones) == 1:
-            # Если конус всего один, считаем границу прямой линией, параллельной оси Z
-            bound_x = np.full_like(z_targets, x_vals[0])
-        else:
-            # Если конусов несколько, строим интерполированную кривую по точкам
-            bound_x = np.interp(z_targets, z_vals, x_vals, left=x_vals[0], right=x_vals[-1])
-            
-        return bound_x, min_z, max_z
-
     def _vision_loop(self):
-        """Основной цикл захвата кадров и их обработки (работает нон-стоп в отдельном потоке)"""
-        # 1. Настройка и открытие камеры ZED
         init_params = sl.InitParameters()
         init_params.camera_resolution = getattr(sl.RESOLUTION, self.config.zed_resolution, sl.RESOLUTION.HD720)
-        init_params.camera_fps = getattr(self.config, 'zed_fps', 15)
+        init_params.camera_fps = self.config.zed_fps
         init_params.coordinate_units = getattr(sl.UNIT, self.config.coordinate_units, sl.UNIT.METER)
        
         if self.zed.open(init_params) != sl.ERROR_CODE.SUCCESS:
@@ -188,279 +154,368 @@ class VisionLoop:
             return
 
         self.robot_state['cam_connected'] = True
-        
-        # Получение параметров камеры (необходимо для перевода 2D пикселей в 3D метры и обратно)
         cam_info = self.zed.get_camera_information()
         self.fx = cam_info.camera_configuration.calibration_parameters.left_cam.fx
         self.cx_cam = cam_info.camera_configuration.calibration_parameters.left_cam.cx
 
         runtime_params = sl.RuntimeParameters()
-        image_zed = sl.Mat() # Область памяти для 2D картинки
-        depth_zed = sl.Mat() # Область памяти для 3D карты глубины
-        
-        # Переменные для расчета и вывода FPS (кадров в секунду)
+        image_zed = sl.Mat()
+
         fps_counter = 0
-        fps_last_time = time.time()
         current_fps = 0
-        
-        # Переменные для записи видео
-        video_writer = None
-        temp_video_path = None
-        final_video_path = None
+        fps_last_time = time.time()
+        rec_timestamp = None
+        was_recording = False
 
-        self.last_frame_time = time.time()
+        grab_error_count = 0
+        max_grab_errors = 5
 
-        # Бесконечный цикл обработки
+        logger.info(f"Обычный автопилот: Оценка глубины по площади + Блокировка виртуальных точек.")
+
         while self.running:
-            # Если успешно захватили новый кадр из ZED
-            if self.zed.grab(runtime_params) == sl.ERROR_CODE.SUCCESS:
-                current_time = time.time()
+            try:
+                grab_result = self.zed.grab(runtime_params)
                 
-                # Расчет реального времени (dt) для ПИД-регулятора
-                dt = current_time - self.last_frame_time
-                self.last_frame_time = current_time
+                if grab_result != sl.ERROR_CODE.SUCCESS:
+                    grab_error_count += 1
+                    
+                    if grab_error_count >= max_grab_errors:
+                        logger.error("Ошибка захвата кадра. Переподключение камеры...")
+                        self.robot_state['cam_connected'] = False
+                        self._reconnect_camera(init_params)
+                        grab_error_count = 0
+                        continue
+                    
+                    time.sleep(0.1)
+                    continue
                 
-                # Извлекаем картинку и карту глубины
+                grab_error_count = 0
+            except Exception as e:
+                logger.error(f"Исключение при grab(): {e}")
+                self.robot_state['cam_connected'] = False
+                time.sleep(0.5)
+                continue
+
+            if grab_result == sl.ERROR_CODE.SUCCESS:
                 self.zed.retrieve_image(image_zed, sl.VIEW.LEFT)
-                self.zed.retrieve_measure(depth_zed, sl.MEASURE.DEPTH)
                 
                 img_data = image_zed.get_data()
-                depth_data = depth_zed.get_data()
-                
-                # Конвертируем формат цвета BGRA -> BGR (убираем альфа-канал, как того требует OpenCV)
-                image_np = cv2.cvtColor(img_data, cv2.COLOR_BGRA2BGR) if img_data.shape[2] == 4 else img_data
-                
-                # === ИНФЕРЕНС (ОБНАРУЖЕНИЕ КОНУСОВ) ===
-                # Отправляем кадр в нейросеть YOLO
-                detections = self.detector.detect(image_np)
-                
-                # === ПАМЯТЬ ОБЪЕКТОВ (ТРЕКИНГ) ===
-                # Удаляем из памяти устаревшие конусы (которых давно не было видно)
-                mem_timeout = getattr(self.config, 'memory_timeout', 0.8)
-                self.memory_cones = [c for c in self.memory_cones if current_time - c['updated_at'] < mem_timeout]
-                
-                # Добавляем или обновляем найденные конусы в памяти
-                for det in detections:
-                    u, v = det['center'] # 2D координаты центра конуса (в пикселях экрана)
-                    z = self._get_robust_depth(depth_data, u, v) # Глубина конуса (в метрах от камеры)
-                    
-                    # Фильтруем слишком близкие и слишком далекие выбросы
-                    if getattr(self.config, 'min_depth', 0.1) < z <= getattr(self.config, 'max_depth', 3.0):
-                        # Переводим 2D в 3D (вычисляем смещение X относительно центра камеры в метрах)
-                        x_cam = (u - self.cx_cam) * z / self.fx
-                        cone_pos = (x_cam, z)
-                        new_class = det.get('name', '')
-                        
-                        found = False
-                        # Проверяем, есть ли уже этот конус в памяти (сравниваем по имени и 3D-дистанции)
-                        for mc in self.memory_cones:
-                            if mc['name'] == new_class:
-                                mx, mz = mc['pos_3d']
-                                # Если расстояние между старой и новой позицией меньше 40 см, считаем, что это один и тот же конус
-                                dist = math.sqrt((x_cam - mx)**2 + (z - mz)**2)
-                                if dist < 0.4:
-                                    mc['pos_3d'] = cone_pos
-                                    mc['updated_at'] = current_time
-                                    found = True
-                                    break
-                        
-                        # Если конус новый (или старый сместился слишком сильно), добавляем его в память
-                        if not found:
-                            self.memory_cones.append({'name': new_class, 'pos_3d': cone_pos, 'updated_at': current_time})
+                if CUDA_AVAILABLE and img_data.shape[2] == 4:
+                    gpu_src = cv2.cuda_GpuMat()
+                    gpu_src.upload(img_data)
+                    image_np = cv2.cuda.cvtColor(gpu_src, cv2.COLOR_BGRA2BGR).download()
+                elif img_data.shape[2] == 4:
+                    image_np = cv2.cvtColor(img_data, cv2.COLOR_BGRA2BGR)
+                else:
+                    image_np = img_data
 
-                # Сортируем конусы по дальности (Z) и берем 6 ближайших для каждой стороны трассы
-                blues = sorted([c['pos_3d'] for c in self.memory_cones if c['name'] in getattr(self.config, 'blue_cones', ['blue'])], key=lambda p: p[1])[:6]
-                yellows = sorted([c['pos_3d'] for c in self.memory_cones if c['name'] in getattr(self.config, 'yellow_cones', ['yellow'])], key=lambda p: p[1])[:6]
-                orange_cones = [c for c in self.memory_cones if c['name'] in getattr(self.config, 'orange_cones', ['orange'])]
+                detect_frame = image_np
+                if image_np.shape[1] > 640 or image_np.shape[0] > 480:
+                    target_width = 480
+                    target_height = 270
+                    scale = min(1.0, target_width / image_np.shape[1], target_height / image_np.shape[0])
+                    if scale < 1.0:
+                        new_w = max(320, int(image_np.shape[1] * scale))
+                        new_h = max(180, int(image_np.shape[0] * scale))
+                        if CUDA_AVAILABLE:
+                            gpu_img = cv2.cuda_GpuMat()
+                            gpu_img.upload(image_np)
+                            detect_frame = cv2.cuda.resize(gpu_img, (new_w, new_h)).download()
+                        else:
+                            detect_frame = cv2.resize(image_np, (new_w, new_h), interpolation=cv2.INTER_AREA)
 
-                # === ПОСТРОЕНИЕ ЦЕНТРА ТРАССЫ ===
-                centerline = []
-                half_track = getattr(self.config, 'track_width', 1.4) / 2.0 # Половина ширины трассы (0.7м)
-                
-                # Создаем виртуальную сетку дальностей от 0.3м до max_depth (3.0м) с шагом 20см
-                z_grid = np.arange(0.3, getattr(self.config, 'max_depth', 3.0), 0.2)
-                
-                # Получаем X-координаты границ трассы слева и справа с помощью интерполяции
-                left_bound_x, l_min_z, l_max_z = self._get_boundary_data(blues, z_grid)
-                right_bound_x, r_min_z, r_max_z = self._get_boundary_data(yellows, z_grid)
-                
-                # Вычисляем центральную линию для каждого метража (z)
-                for i, z in enumerate(z_grid):
-                    lx = left_bound_x[i] if left_bound_x is not None else None
-                    rx = right_bound_x[i] if right_bound_x is not None else None
+                crop_top = int(detect_frame.shape[0] * 0.20)
+                crop_bottom = int(detect_frame.shape[0] * 0.20)
+                if crop_top > 0 or crop_bottom > 0:
+                    detect_frame = detect_frame[crop_top:detect_frame.shape[0] - crop_bottom, :]
+
+                self.frame_counter += 1
+                should_process = (self.frame_counter % self.process_every) == 0
+
+                detections = self.last_detections
+                waypoints_3d = self.last_waypoints_3d
+                target_x = self.last_target_x
+                target_z = self.last_target_z
+                target_detected = self.last_target_detected
+
+                if should_process:
+                    detections = self.detector.detect(detect_frame)
+                    if detect_frame is not image_np:
+                        scale_x = image_np.shape[1] / detect_frame.shape[1]
+                        scale_y = image_np.shape[0] / detect_frame.shape[0]
+                        for det in detections:
+                            x1, y1, x2, y2 = det['bbox']
+                            det['bbox'] = (
+                                int(x1 * scale_x),
+                                int(y1 * scale_y),
+                                int(x2 * scale_x),
+                                int(y2 * scale_y),
+                            )
+                            center = det.get('center')
+                            if center is not None:
+                                det['center'] = (int(center[0] * scale_x), int(center[1] * scale_y))
+
+current_time = time.time()
                     
-                    # Проверяем, что граница в этой точке (на глубине Z) опирается на реальные данные, а не уходит в бесконечность
-                    valid_l = lx is not None and (l_min_z - 0.4 <= z <= l_max_z + 0.4)
-                    valid_r = rx is not None and (r_min_z - 0.4 <= z <= r_max_z + 0.4)
+                    # 1. Очистка старых конусов из памяти
+                    mem_timeout = getattr(self.config, 'memory_timeout', 0.8)
+                    self.memory_cones = [c for c in self.memory_cones if current_time - c['updated_at'] < mem_timeout]
                     
-                    if valid_l and valid_r:
-                        cx = (lx + rx) / 2.0         # Видим обе границы: центр ровно посередине
-                    elif valid_l:
-                        cx = lx + half_track         # Видим только левую границу: отступаем 0.7м вправо
-                    elif valid_r:
-                        cx = rx - half_track         # Видим только правую границу: отступаем 0.7м влево
-                    else:
-                        # Если вышли за пределы достоверных данных, берем последнюю известную логику
-                        if lx is not None and rx is not None:
+                    for det in detections:
+                        x1, y1, x2, y2 = det['bbox']
+                        width = max(x2 - x1, 1)
+                        height = max(y2 - y1, 1)
+                        area = width * height
+                        
+                        z = self.config.area_depth_constant / math.sqrt(area)
+                        
+                        if self.config.min_depth < z <= self.config.max_depth:
+                            u, v = det['center']
+                            x_cam = (u - self.cx_cam) * z / self.fx
+                            cone_pos = (x_cam, z - self.config.camera_offset_z)
+                            det['pos_3d'] = cone_pos
+                            cone_name = det.get('name', '')
+                            
+                            # 2. Обновление памяти конусов
+                            found = False
+                            for mc in self.memory_cones:
+                                if mc['name'] == cone_name:
+                                    mx, mz = mc['pos_3d']
+                                    dist = math.sqrt((x_cam - mx)**2 + (z - self.config.camera_offset_z - mz)**2)
+                                    if dist < 0.4:
+                                        mc['pos_3d'] = cone_pos
+                                        mc['updated_at'] = current_time
+                                        found = True
+                                        break
+                            
+                            if not found:
+                                self.memory_cones.append({'name': cone_name, 'pos_3d': cone_pos, 'updated_at': current_time})
+                            
+                            if self.config.draw_target_z:
+                                cv2.putText(image_np, f"Z:{z:.1f}m", (x1, y1-25), 
+                                           cv2.FONT_HERSHEY_SIMPLEX, 
+                                           self.config.z_text_scale, 
+                                           self.config.z_text_color, 
+                                           self.config.z_text_thickness)
+
+                    # 3. Извлекаем координаты из памяти для алгоритма
+                    blues = sorted([c['pos_3d'] for c in self.memory_cones if c['name'] in self.config.blue_cones], key=lambda p: p[1])[:6]
+                    yellows = sorted([c['pos_3d'] for c in self.memory_cones if c['name'] in self.config.yellow_cones], key=lambda p: p[1])[:6]
+                    orange_cones = [c for c in self.memory_cones if c['name'] in self.config.orange_cones]
+
+                    # 4. Интерполяция траектории (алгоритм server2.py)
+                    centerline = []
+                    half_track = self.config.track_width / 2.0
+                    z_grid = np.arange(0.3, self.config.max_depth, 0.2)
+                    
+                    left_bound_x, l_min_z, l_max_z = self._get_boundary_data(blues, z_grid)
+                    right_bound_x, r_min_z, r_max_z = self._get_boundary_data(yellows, z_grid)
+                    
+                    for i, z in enumerate(z_grid):
+                        lx = left_bound_x[i] if left_bound_x is not None else None
+                        rx = right_bound_x[i] if right_bound_x is not None else None
+                        
+                        valid_l = lx is not None and (l_min_z - 0.4 <= z <= l_max_z + 0.4)
+                        valid_r = rx is not None and (r_min_z - 0.4 <= z <= r_max_z + 0.4)
+                        
+                        if valid_l and valid_r:
                             cx = (lx + rx) / 2.0
-                        elif lx is not None:
+                        elif valid_l:
                             cx = lx + half_track
-                        elif rx is not None:
+                        elif valid_r:
                             cx = rx - half_track
                         else:
-                            cx = 0.0 # Если конусов нет вообще, центр трассы прямо по курсу
-                            
-                    centerline.append((cx, z))
+                            if lx is not None and rx is not None:
+                                cx = (lx + rx) / 2.0
+                            elif lx is not None:
+                                cx = lx + half_track
+                            elif rx is not None:
+                                cx = rx - half_track
+                            else:
+                                cx = 0.0 
+                                
+                        centerline.append((cx, z))
 
-                # ==========================================
-                # ДИНАМИЧЕСКИЙ LOOKAHEAD (ВЗГЛЯД ВПЕРЕД)
-                # ==========================================
-                # Смысл: чем быстрее едем, тем дальше вперед нужно смотреть, чтобы успеть повернуть.
-                current_pwm = self.robot_state.get('current_pwm', getattr(self.config, 'forward_speed', 1570))
-                neutral_pwm = getattr(self.config, 'neutral_speed', 1500)
-                max_pwm = getattr(self.config, 'max_speed_pwm', 1600)
-                
-                # Вычисляем процент текущей скорости от 0.0 до 1.0
-                speed_factor = max(0.0, min(1.0, (current_pwm - neutral_pwm) / (max_pwm - neutral_pwm + 1e-5)))
-                
-                lookahead_min = getattr(self.config, 'lookahead_min', 0.3)
-                lookahead_max = getattr(self.config, 'lookahead_max', 1.2)
-                
-                # Линейно масштабируем дальность взгляда от скорости
-                lookahead_dist = lookahead_min + speed_factor * (lookahead_max - lookahead_min)
-                
-                # Ищем целевую точку (target_wp) на вычисленном расстоянии
-                target_wp = None
-                for cx, cz in centerline:
-                    if cz >= lookahead_dist:
-                        target_wp = (cx, cz)
-                        break
-                        
-                if target_wp is None and len(centerline) > 0:
-                    target_wp = centerline[-1] # Если трасса короче, чем lookahead, берем самую дальнюю точку
+                    # Подготавливаем массив для совместимости со старой отрисовкой
+                    waypoints_3d = [{'x': cx, 'z': cz, 'type': 'centerline'} for cx, cz in centerline]
 
-                # === СГЛАЖИВАНИЕ ЦЕЛЕВОЙ ТОЧКИ (EMA) ===
-                if target_wp is not None:
-                    tx, tz = target_wp
-                    alpha = getattr(self.config, 'ema_alpha', 0.3) # Коэффициент сглаживания
-                    # Плавно двигаем старую цель к новой, чтобы избежать резких рывков руля
-                    self.smooth_tx = self.smooth_tx + alpha * (tx - self.smooth_tx)
-                    self.smooth_tz = self.smooth_tz + alpha * (tz - self.smooth_tz)
-                    # Вычисляем нужный угол поворота в радианах
-                    error_angle = math.atan2(self.smooth_tx, self.smooth_tz)
-                else:
-                    # Если точек нет (потеряли трассу), плавно возвращаем руль в центр
-                    decay = getattr(self.config, 'error_decay_rate', 0.85)
-                    self.smooth_tx *= decay
-                    error_angle = math.atan2(self.smooth_tx, self.smooth_tz)
-                    
-                self.last_error_angle = error_angle
-
-                # === УПРАВЛЕНИЕ АВТОМОБИЛЕМ ===
-                stop_threshold = getattr(self.config, 'stop_cone_z_threshold', 0.4)
-                # Проверяем, есть ли оранжевый стоп-конус ближе дистанции остановки (0.4м)
-                stop_detected = any(oc['pos_3d'][1] <= stop_threshold for oc in orange_cones)
-                steering = 0.0
-
-                if self.robot_state.get('auto_mode', False):
-                    if stop_detected:
-                        self.robot_state['auto_mode'] = False
-                        self.robot_state['msg'] = "ФИНИШ! СТОП-КОНУС."
-                        self.car.stop() # Тормозим!
-                    else:
-                        # Вычисляем угол руля через ПИД-регулятор (используя честный dt)
-                        steering = self.pid.compute(error_angle, dt=dt)
-                        # Отправляем газ (1.0 = скорость из конфига) и руль на Arduino
-                        self.car.update(1.0, steering)
-                else:
-                    # В ручном режиме сбрасываем накопленную ошибку ПИД, чтобы при включении автопилота машину не дернуло
-                    self.pid.reset()
-
-                # === ОТРИСОВКА ИНТЕРФЕЙСА (ВИЗУАЛИЗАЦИЯ) ===
-                start_u, start_v = image_np.shape[1] // 2, image_np.shape[0] # Координаты центра низа экрана
-                
-                # Рисуем линию траектории (по точкам centerline)
-                if getattr(self.config, 'draw_trajectory', True) and len(centerline) > 0:
-                    pts_2d = [[start_u, start_v]]
+                    # 5. ВЫБОР ЦЕЛИ (Статичный lookahead)
+                    lookahead_dist = self.config.lookahead_distance
+                    target_wp = None
                     for cx, cz in centerline:
-                        # Перевод координат из 3D-метров обратно в пиксели
-                        u = int((cx * self.fx / cz) + self.cx_cam)
-                        v = int(image_np.shape[0] * getattr(self.config, 'cone_base_v', 0.65)) # Примерная высота пола
-                        u = max(-5000, min(image_np.shape[1] + 5000, u)) # Защита от вылета за границы экрана
-                        pts_2d.append([u, v])
-                    if len(pts_2d) > 1:
-                        pts_arr = np.array(pts_2d, np.int32).reshape((-1, 1, 2))
-                        cv2.polylines(image_np, [pts_arr], False, getattr(self.config, 'trajectory_color', [0,255,0]), 2)
+                        if cz >= lookahead_dist:
+                            target_wp = (cx, cz)
+                            break
+                            
+                    if target_wp is None and len(centerline) > 0:
+                        target_wp = centerline[-1]
 
-                # Рисуем крестик целевой точки (куда стремится машина в данный момент)
-                if getattr(self.config, 'draw_target', True) and self.smooth_tz > 0:
-                    tu = int((self.smooth_tx * self.fx / self.smooth_tz) + self.cx_cam)
-                    tv = int(image_np.shape[0] * getattr(self.config, 'cone_base_v', 0.65))
-                    cv2.drawMarker(image_np, (tu, tv), (0, 0, 255), cv2.MARKER_CROSS, 25, 3)
-                    cv2.line(image_np, (start_u, start_v), (tu, tv), (0, 100, 255), 2)
+                    # 6. EMA Сглаживание целевой точки
+                    if target_wp is not None:
+                        tx, tz = target_wp
+                        alpha = getattr(self.config, 'ema_alpha', 0.4)
+                        self.smooth_tx = self.smooth_tx + alpha * (tx - self.smooth_tx)
+                        self.smooth_tz = self.smooth_tz + alpha * (tz - self.smooth_tz)
+                    else:
+                        decay = getattr(self.config, 'error_decay_rate', 0.85)
+                        self.smooth_tx *= decay
 
-                # Вычисление FPS с интервалом обновления (чтобы цифры не мельтешили каждый кадр)
+                    target_x = self.smooth_tx
+                    target_z = self.smooth_tz
+
+                    # 7. Проверка стоп-конуса
+                    target_detected = False
+                    if orange_cones:
+                        stop_threshold = getattr(self.config, 'stop_cone_z_threshold', 0.5)
+                        if any(oc['pos_3d'][1] <= stop_threshold for oc in orange_cones):
+                            target_detected = True
+
+                    # ОТРИСОВКА ТРАЕКТОРИИ
+                    if self.config.draw_trajectory and should_process:
+                        pts_2d = [[image_np.shape[1]//2, image_np.shape[0]]]
+                        for wp in waypoints_3d:
+                            u = int((wp['x'] * self.fx / wp['z']) + self.cx_cam)
+                            v = int(image_np.shape[0] * self.config.cone_base_v)
+                            pts_2d.append([u, v])
+                        if len(pts_2d) > 1:
+                            pts_arr = np.array(pts_2d, np.int32).reshape((-1, 1, 2))
+                            cv2.polylines(image_np, [pts_arr], isClosed=False, 
+                                         color=self.config.trajectory_color, 
+                                         thickness=self.config.trajectory_thickness)
+
+                    # ОТРИСОВКА ЦЕЛИ
+                    if target_x is not None and target_z > 0:
+                        if self.config.draw_target:
+                            target_u = int((target_x * self.fx / target_z) + self.cx_cam)
+                            target_v = int(image_np.shape[0] * self.config.cone_base_v)
+                            cv2.drawMarker(image_np, (target_u, target_v), (0, 0, 255), 
+                                          cv2.MARKER_CROSS, 
+                                          self.config.target_cross_size, 
+                                          self.config.target_cross_thickness)
+
+                    # ОТРИСОВКА КОНУСОВ
+                    if self.config.draw_detections and should_process:
+                        for det in detections:
+                            x1, y1, x2, y2 = det['bbox']
+                            cone_name = det.get('name', '')
+                            
+                            if cone_name in self.config.blue_cones:
+                                color = (255, 0, 0)
+                            elif cone_name in self.config.yellow_cones:
+                                color = (0, 255, 255)
+                            elif cone_name in self.config.orange_cones:
+                                color = (0, 165, 255)
+                            else:
+                                color = (255, 255, 255)
+                            
+                            cv2.rectangle(image_np, (x1, y1), (x2, y2), color, 2)
+                            cv2.putText(image_np, cone_name, (x1, y1-10), 
+                                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+
+                    # УПРАВЛЕНИЕ 
+                    if self.robot_state.get('auto_mode', False):
+                        if target_detected:
+                            self.robot_state['auto_mode'] = False
+                            self.robot_state['msg'] = "ФИНИШ! ОРАНЖЕВЫЙ КОНУС."
+                            self.robot_state['msg_time'] = time.time()
+                            def _brake(car=self.car):
+                                car.stop()
+                            threading.Thread(target=_brake, daemon=True).start()
+                        elif target_x is not None and target_z > 0:
+                            error = math.atan2(target_x, target_z)
+                            steer_k = self.config.kp_gain  # <--- Теперь рулит по kp_gain
+                            steering = max(-1.0, min(1.0, error * steer_k))
+                            self.car.update(1.0, steering)
+
+                # FPS 
                 fps_counter += 1
-                if current_time - fps_last_time >= getattr(self.config, 'fps_update_interval', 0.5):
-                    current_fps = fps_counter / getattr(self.config, 'fps_update_interval', 0.5)
+                if time.time() - fps_last_time >= self.config.fps_update_interval:
+                    current_fps = fps_counter
                     fps_counter = 0
-                    fps_last_time = current_time
+                    fps_last_time = time.time()
                 
-                # Рисуем текст с телеметрией в левом верхнем углу
-                if getattr(self.config, 'draw_fps', True):
-                    status_txt = f"FPS:{current_fps:.1f} | Lookahead:{lookahead_dist:.2f}m | Steer:{steering:.2f}"
-                    cv2.putText(image_np, status_txt, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+                if self.config.draw_fps:
+                    cv2.putText(image_np, f"FPS: {current_fps} Mode: {'AUTO' if self.robot_state.get('auto_mode') else 'MANUAL'}", 
+                               (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 
+                               self.config.fps_text_scale, self.config.fps_text_color, self.config.fps_text_thickness)
+                if target_x is not None and self.config.draw_target_z:
+                    cv2.putText(image_np, f"Target Z: {target_z:.2f}m", (10, 85), cv2.FONT_HERSHEY_SIMPLEX, 
+                               self.config.target_z_text_scale, self.config.target_z_text_color, self.config.target_z_text_thickness)
                 
-                # === ЗАПИСЬ ВИДЕО ===
+                # ЗАПИСЬ
                 if self.is_recording:
-                    if getattr(self.config, 'draw_rec', True):
-                        cv2.putText(image_np, "REC", (10, 55), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
-                    
-                    # Если запись только началась, создаем объект VideoWriter
-                    if video_writer is None:
-                        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                        temp_video_path = os.path.join(self.config.output_folder, f"temp_{timestamp}.avi")
-                        final_video_path = os.path.join(self.config.output_folder, f"rec_{timestamp}.mp4")
-                        height, width = image_np.shape[:2]
-                        # Используем быстрый кодек MJPG для временного файла, чтобы не нагружать процессор (jetson/raspberry) в полете
-                        fourcc = cv2.VideoWriter_fourcc(*'MJPG')
-                        video_writer = cv2.VideoWriter(temp_video_path, fourcc, 15, (width, height))
-                    
-                    video_writer.write(image_np)
+                    if self.config.draw_rec:
+                        cv2.putText(image_np, "REC", (10, 55), cv2.FONT_HERSHEY_SIMPLEX,
+                                   self.config.rec_text_scale, self.config.rec_text_color, self.config.rec_text_thickness)
+                    if not was_recording:
+                        rec_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                        was_recording = True
+                    if not self.rec_queue.full():
+                        self.rec_queue.put((image_np.copy(), rec_timestamp))
                 else:
-                    # Если запись выключили, закрываем файл и запускаем фоновую конвертацию в H.264
-                    if video_writer is not None:
-                        video_writer.release()
-                        video_writer = None
-                        threading.Thread(target=self._convert_video, args=(temp_video_path, final_video_path, 15)).start()
+                    if was_recording:
+                        self.rec_queue.put(None)
+                        was_recording = False
 
-                # Отправляем готовый кадр на веб-сервер (в файл Web.py) для трансляции в браузер
-                set_frame(image_np)
+                # ОТПРАВКА НА WEB
+                if self.frame_counter % self.publish_every == 0:
+                    set_frame(image_np)
 
-        # При выходе из цикла (выключение программы) закрываем файлы и камеру
-        if video_writer is not None:
-            video_writer.release()
         self.zed.close()
         self.robot_state['cam_connected'] = False
-
-    def start_recording(self):
-        """Включить запись видео (вызывается из главного потока по UDP)"""
-        self.is_recording = True
-
-    def stop_recording(self):
-        """Выключить запись видео (вызывается из главного потока по UDP)"""
-        self.is_recording = False
+    
+    def _reconnect_camera(self, init_params):
+        """Попытка переподключения к камере"""
+        try:
+            self.zed.close()
+            time.sleep(0.5)
+        except Exception as e:
+            pass
+        
+        try:
+            self.zed = sl.Camera()
+            if self.zed.open(init_params) == sl.ERROR_CODE.SUCCESS:
+                self.robot_state['cam_connected'] = True
+                cam_info = self.zed.get_camera_information()
+                self.fx = cam_info.camera_configuration.calibration_parameters.left_cam.fx
+                self.cx_cam = cam_info.camera_configuration.calibration_parameters.left_cam.cx
+            else:
+                self.robot_state['cam_connected'] = False
+        except Exception as e:
+            logger.error(f"Ошибка переподключения камеры: {e}")
+            self.robot_state['cam_connected'] = False
 
     def close(self):
-        """Остановить поток зрения корректно"""
         self.running = False
-        self.vision_thread.join(timeout=3.0) # Ждем завершения потока до 3 секунд
+        self.robot_state['cam_connected'] = False
+        try:
+            if getattr(self, 'zed', None) is not None:
+                self.zed.close()
+        except Exception:
+            pass
+        if getattr(self, 'vision_thread', None) is not None and self.vision_thread.is_alive():
+            self.vision_thread.join(timeout=self.config.vision_thread_join_timeout)
+        if getattr(self, 'rec_thread', None) is not None and self.rec_thread.is_alive():
+            self.rec_queue.put(None)
+            self.rec_thread.join(timeout=3.0)
+        self.zed = None
 
-# ==========================================
-# ТОЧКА ВХОДА (СЕРВЕРНАЯ ЧАСТЬ)
-# ==========================================
+    def restart(self):
+        self.close()
+        time.sleep(0.5)
+        self.running = True
+        self.is_recording = False
+        self.fx = 0
+        self.cx_cam = 0
+        self.zed = sl.Camera()
+        self.rec_queue = queue.Queue(maxsize=30)
+        self.rec_thread = threading.Thread(target=self._rec_loop, daemon=True)
+        self.rec_thread.start()
+        self.vision_thread = threading.Thread(target=self._vision_loop, daemon=True)
+        self.vision_thread.start()
+
+
 def main():
-    # Настройка UDP сокета для приема команд (например, с джойстика, смартфона или другого ПК)
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.settimeout(config.socket_timeout)
     try:
@@ -468,85 +523,109 @@ def main():
     except:
         sys.exit(1)
     
-    # Инициализация нейросети (TensorRT) и контроллера Arduino
     detector = ConeDetector(config)
     car = CarController(config)
-    
-    # Общее состояние робота (словарь, который читает/пишет и этот цикл, и цикл компьютерного зрения)
-    start_speed = getattr(config, 'forward_speed', 1570)
-    robot_state = {'auto_mode': False, 'cam_connected': False, 'msg': '', 'msg_time': 0, 'current_pwm': start_speed}
-    
-    # Запуск потока камеры
+    robot_state = {'auto_mode': False, 'cam_connected': False, 'arduino_connected': False, 'msg': '', 'msg_time': 0}
+    robot_state['arduino_connected'] = car.arduino is not None
     loop = VisionLoop(config, detector, car, robot_state)
     running = True
+    last_addr = None
     
     try:
         while running:
             try:
-                # Ожидаем команды по UDP
                 data, addr = sock.recvfrom(1024)
+                last_addr = addr
                 command = data.decode('utf-8').strip()
-                
-                # Обработка входящих команд
-                if command == "Q":         # Выход из программы
+                if command == "Q":
                     running = False
                     break
-                elif command == "A":       # Включить автопилот
+                elif command == "A":
                     if not robot_state['auto_mode']:
                         robot_state['auto_mode'] = True
                         robot_state['msg'] = ''
-                elif command == "S":       # Остановка / Выключение автопилота
+                elif command == "S":
                     if robot_state['auto_mode']:
                         robot_state['auto_mode'] = False
                         car.stop()
-                elif command == "R":       # Старт записи видео
-                    loop.start_recording()
-                elif command == "C":       # Стоп записи видео
-                    loop.stop_recording()
-                elif command.startswith("speed:"): # Изменение скорости на лету (например "speed:1580,1420")
+                elif command == "R":
+                    loop.is_recording = True
+                elif command == "C":
+                    loop.is_recording = False
+                elif command == "F":
+                    # ПЕРЕЗАГРУЗКА: отключение и повторное включение системы
+                    robot_state['auto_mode'] = False
+                    robot_state['msg'] = 'ПЕРЕЗАГРУЗКА...'
+                    robot_state['msg_time'] = time.time()
+                    logger.info("Инициирована перезагрузка системы...")
+                    
+                    # Отключение Arduino
+                    car.close()
+                    time.sleep(0.5)
+                    
+                    # Отключение камеры
+                    loop.close()
+                    time.sleep(0.5)
+                    
+                    # Повторное включение Arduino
+                    car.restart()
+                    time.sleep(0.5)
+                    
+                    # Повторное включение камеры
+                    robot_state['cam_connected'] = False
+                    loop.restart()
+                    time.sleep(1.0)
+                    
+                    # Обновляем статусы подключения
+                    robot_state['cam_connected'] = loop.robot_state.get('cam_connected', False)
+                    robot_state['arduino_connected'] = car.arduino is not None
+                    robot_state['msg'] = 'СИСТЕМА ПЕРЕЗАГРУЖЕНА!'
+                    robot_state['msg_time'] = time.time()
+                    logger.info("Система успешно перезагружена!")
+                elif command.startswith("speed:"):
                     try:
                         fwd, bck = map(int, command[6:].split(','))
                         car.set_speeds(fwd, bck)
-                        robot_state['current_pwm'] = fwd  # Обновляем для расчета динамического взгляда
                     except:
                         pass
                 else:
-                    # Если мы НЕ в авторежиме, обрабатываем прямые команды управления (ручной пульт)
-                    # Ожидаемый формат: "speed,steering" (от -1.0 до 1.0)
-                    if not robot_state['auto_mode']:
-                        try:
-                            speed, steering = map(float, command.split(','))
+                    try:
+                        speed, steering = map(float, command.split(','))
+                        if robot_state['auto_mode'] and (speed != 0.0 or steering != 0.0):
+                            robot_state['auto_mode'] = False
+                            robot_state['msg_time'] = time.time()
+                        if not robot_state['auto_mode']:
                             car.update(speed, steering)
-                        except:
-                            pass
+                    except:
+                        pass
 
-                # Очистка старых сообщений интерфейса (например "ФИНИШ! СТОП-КОНУС")
                 if time.time() - robot_state['msg_time'] > config.message_clear_timeout:
                     robot_state['msg'] = ''
-                    
-                # Формируем и отправляем телеметрию обратно клиенту
+                
+                # Обновляем статус подключения Arduino
+                robot_state['arduino_connected'] = car.arduino is not None
+                
                 telemetry = {
                     "mode": "AUTO" if robot_state['auto_mode'] else "MANUAL",
                     "rec": loop.is_recording,
                     "cam_connected": robot_state['cam_connected'],
-                    "fwd": robot_state['current_pwm'],
-                    "bck": getattr(config, 'back_speed', 1430),
+                    "arduino_connected": robot_state['arduino_connected'],
+                    "fwd": car.config.forward_speed,
+                    "bck": car.config.back_speed,
                     "msg": robot_state['msg']
                 }
-                sock.sendto(json.dumps(telemetry).encode('utf-8'), addr)
-                
+                if last_addr:
+                    sock.sendto(json.dumps(telemetry).encode('utf-8'), last_addr)
             except socket.timeout:
-                # Если долго нет команд по UDP, проверяем, не пора ли остановить машинку (Watchdog)
-                # Это защита на случай, если мы управляем руками и оборвалась связь
                 if not robot_state['auto_mode']:
                     car.check_stop()
     except KeyboardInterrupt:
         pass
     finally:
-        # Корректное закрытие всех процессов при завершении программы (Ctrl+C или команда Q)
         loop.close()
         car.close()
         sock.close()
+
 
 if __name__ == "__main__":
     main()

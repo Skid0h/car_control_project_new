@@ -52,11 +52,18 @@ class CarController:
        
         steering_clamped = max(-1.0, min(1.0, float(steering)))
         steer_value = int(self.config.center_steering - (steering_clamped * self.config.steering_range))
-        steer_value = max(0, min(270, steer_value))
+        steer_value = max(0, min(180, steer_value))
        
         command = f"<{motor_value},{steer_value}>"
         current_time = time.time()
-        if command != self.last_sent_cmd or (current_time - self.last_sent_time) > self.config.command_interval:
+        should_send = False
+
+        if self.last_sent_cmd != command:
+            should_send = True
+        elif (current_time - self.last_sent_time) > self.config.command_interval:
+            should_send = True
+
+        if should_send:
             with self.lock:
                 try:
                     self.arduino.write(command.encode('utf-8'))
@@ -82,3 +89,19 @@ class CarController:
         self.stop()
         time.sleep(self.config.arduino_close_delay)
         if self.arduino: self.arduino.close()
+    
+    def restart(self):
+        """Перезагрузка подключения Arduino"""
+        self.close()
+        time.sleep(0.5)
+        port = find_arduino_port()
+        if port is None: 
+            self.arduino = None
+            return
+        try:
+            self.arduino = serial.Serial(port, self.config.baud_rate, timeout=1)
+            time.sleep(self.config.arduino_init_delay)
+            self.stop()
+            time.sleep(self.config.arduino_post_stop_delay)
+        except Exception as e:
+            self.arduino = None

@@ -213,25 +213,25 @@ class VisionLoop:
                 else:
                     image_np = img_data
 
-                detect_frame = image_np
-                if image_np.shape[1] > 640 or image_np.shape[0] > 480:
+                detect_frame = image_np.copy()
+                if detect_frame.shape[1] > 640 or detect_frame.shape[0] > 480:
                     target_width = 480
                     target_height = 270
-                    scale = min(1.0, target_width / image_np.shape[1], target_height / image_np.shape[0])
+                    scale = min(1.0, target_width / detect_frame.shape[1], target_height / detect_frame.shape[0])
                     if scale < 1.0:
-                        new_w = max(320, int(image_np.shape[1] * scale))
-                        new_h = max(180, int(image_np.shape[0] * scale))
+                        new_w = max(320, int(detect_frame.shape[1] * scale))
+                        new_h = max(180, int(detect_frame.shape[0] * scale))
                         if CUDA_AVAILABLE:
                             gpu_img = cv2.cuda_GpuMat()
-                            gpu_img.upload(image_np)
+                            gpu_img.upload(detect_frame)
                             detect_frame = cv2.cuda.resize(gpu_img, (new_w, new_h)).download()
                         else:
-                            detect_frame = cv2.resize(image_np, (new_w, new_h), interpolation=cv2.INTER_AREA)
+                            detect_frame = cv2.resize(detect_frame, (new_w, new_h), interpolation=cv2.INTER_AREA)
 
-                crop_top = int(detect_frame.shape[0] * 0.20)
-                crop_bottom = int(detect_frame.shape[0] * 0.20)
-                if crop_top > 0 or crop_bottom > 0:
-                    detect_frame = detect_frame[crop_top:detect_frame.shape[0] - crop_bottom, :]
+                # --- ROI: Игнорируем верхние 30% ---
+                crop_top = int(detect_frame.shape[0] * 0.30)
+                if crop_top > 0:
+                    detect_frame[:crop_top, :] = 0  # Заливаем верх черным
 
                 self.frame_counter += 1
                 should_process = (self.frame_counter % self.process_every) == 0

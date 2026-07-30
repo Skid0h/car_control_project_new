@@ -54,7 +54,6 @@ class Config:
         self.min_depth = ap['min_depth']
         self.track_width = ap['track_width']
         self.lookahead_distance = ap['lookahead_distance']
-	self.memory_timeout = ap.get('memory_timeout', 0.8)
         self.pair_z_tolerance = ap['pair_z_tolerance']
         self.pair_x_tolerance_multiplier = ap['pair_x_tolerance_multiplier']
         self.virtual_point_offset = ap['virtual_point_offset']

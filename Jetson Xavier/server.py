@@ -1,6 +1,6 @@
 """
 Запускается на Jetson.
-АЛГОРИТМ: Обычный автопилот (Оценка глубины по площади + Пары + Блокировка виртуальных точек).
+АЛГОРИТМ: Мгновенный отклик, интерполяция границ трассы, без памяти конусов.
 ФАЙЛ КОНФИГУРАЦИИ. ПОМЕХОЗАЩИЩЕННЫЙ UART.
 """
 
@@ -55,10 +55,14 @@ class VisionLoop:
         self.last_target_z = None
         self.last_target_detected = False
 
-	# --- Добавлено для нового алгоритма нахождения пути ---
-	self.memory_cones = []
+        # --- Состояние для алгоритма нахождения пути ---
         self.smooth_tx = 0.0
         self.smooth_tz = self.config.lookahead_distance
+        
+        # --- Состояние ПИД-регулятора ---
+        self.pid_integral = 0.0
+        self.pid_last_error = 0.0
+        self.last_pid_time = time.time()
        
         if not os.path.exists(self.config.output_folder):
             os.makedirs(self.config.output_folder)
@@ -74,7 +78,7 @@ class VisionLoop:
         self.vision_thread.start()
 
     def _get_boundary_data(self, cones, z_targets):
-        """ДОБАВЛЕНО Интерполяция X-координат с фильтрацией выбросов"""
+        """Интерполяция X-координат с фильтрацией выбросов"""
         valid_cones = [c for c in cones if abs(c[0]) < 2.5]
         
         if not valid_cones:
@@ -170,7 +174,7 @@ class VisionLoop:
         grab_error_count = 0
         max_grab_errors = 5
 
-        logger.info(f"Обычный автопилот: Оценка глубины по площади + Блокировка виртуальных точек.")
+        logger.info(f"Автопилот запущен: Быстрая реакция + Без памяти.")
 
         while self.running:
             try:
@@ -255,12 +259,10 @@ class VisionLoop:
                             if center is not None:
                                 det['center'] = (int(center[0] * scale_x), int(center[1] * scale_y))
 
-current_time = time.time()
+                    current_time = time.time()
+                    current_cones = []
                     
-                    # 1. Очистка старых конусов из памяти
-                    mem_timeout = getattr(self.config, 'memory_timeout', 0.8)
-                    self.memory_cones = [c for c in self.memory_cones if current_time - c['updated_at'] < mem_timeout]
-                    
+                    # 1. Сбор конусов только с текущего кадра (БЕЗ ПАМЯТИ)
                     for det in detections:
                         x1, y1, x2, y2 = det['bbox']
                         width = max(x2 - x1, 1)
@@ -276,20 +278,7 @@ current_time = time.time()
                             det['pos_3d'] = cone_pos
                             cone_name = det.get('name', '')
                             
-                            # 2. Обновление памяти конусов
-                            found = False
-                            for mc in self.memory_cones:
-                                if mc['name'] == cone_name:
-                                    mx, mz = mc['pos_3d']
-                                    dist = math.sqrt((x_cam - mx)**2 + (z - self.config.camera_offset_z - mz)**2)
-                                    if dist < 0.4:
-                                        mc['pos_3d'] = cone_pos
-                                        mc['updated_at'] = current_time
-                                        found = True
-                                        break
-                            
-                            if not found:
-                                self.memory_cones.append({'name': cone_name, 'pos_3d': cone_pos, 'updated_at': current_time})
+                            current_cones.append({'name': cone_name, 'pos_3d': cone_pos})
                             
                             if self.config.draw_target_z:
                                 cv2.putText(image_np, f"Z:{z:.1f}m", (x1, y1-25), 
@@ -298,12 +287,12 @@ current_time = time.time()
                                            self.config.z_text_color, 
                                            self.config.z_text_thickness)
 
-                    # 3. Извлекаем координаты из памяти для алгоритма
-                    blues = sorted([c['pos_3d'] for c in self.memory_cones if c['name'] in self.config.blue_cones], key=lambda p: p[1])[:6]
-                    yellows = sorted([c['pos_3d'] for c in self.memory_cones if c['name'] in self.config.yellow_cones], key=lambda p: p[1])[:6]
-                    orange_cones = [c for c in self.memory_cones if c['name'] in self.config.orange_cones]
+                    # 2. Сортировка свежих детекций по глубине
+                    blues = sorted([c['pos_3d'] for c in current_cones if c['name'] in self.config.blue_cones], key=lambda p: p[1])[:6]
+                    yellows = sorted([c['pos_3d'] for c in current_cones if c['name'] in self.config.yellow_cones], key=lambda p: p[1])[:6]
+                    orange_cones = [c for c in current_cones if c['name'] in self.config.orange_cones]
 
-                    # 4. Интерполяция траектории (алгоритм server2.py)
+                    # 3. Интерполяция траектории
                     centerline = []
                     half_track = self.config.track_width / 2.0
                     z_grid = np.arange(0.3, self.config.max_depth, 0.2)
@@ -336,10 +325,9 @@ current_time = time.time()
                                 
                         centerline.append((cx, z))
 
-                    # Подготавливаем массив для совместимости со старой отрисовкой
                     waypoints_3d = [{'x': cx, 'z': cz, 'type': 'centerline'} for cx, cz in centerline]
 
-                    # 5. ВЫБОР ЦЕЛИ (Статичный lookahead)
+                    # 4. ВЫБОР ЦЕЛИ (Lookahead)
                     lookahead_dist = self.config.lookahead_distance
                     target_wp = None
                     for cx, cz in centerline:
@@ -350,20 +338,20 @@ current_time = time.time()
                     if target_wp is None and len(centerline) > 0:
                         target_wp = centerline[-1]
 
-                    # 6. EMA Сглаживание целевой точки
+                    # 5. EMA Сглаживание целевой точки (теперь очень слабое для мгновенной реакции)
                     if target_wp is not None:
                         tx, tz = target_wp
-                        alpha = getattr(self.config, 'ema_alpha', 0.4)
+                        alpha = getattr(self.config, 'ema_alpha', 0.85)
                         self.smooth_tx = self.smooth_tx + alpha * (tx - self.smooth_tx)
                         self.smooth_tz = self.smooth_tz + alpha * (tz - self.smooth_tz)
                     else:
-                        decay = getattr(self.config, 'error_decay_rate', 0.85)
+                        decay = getattr(self.config, 'error_decay_rate', 0.5)
                         self.smooth_tx *= decay
 
                     target_x = self.smooth_tx
                     target_z = self.smooth_tz
 
-                    # 7. Проверка стоп-конуса
+                    # 6. Проверка стоп-конуса
                     target_detected = False
                     if orange_cones:
                         stop_threshold = getattr(self.config, 'stop_cone_z_threshold', 0.5)
@@ -412,7 +400,7 @@ current_time = time.time()
                             cv2.putText(image_np, cone_name, (x1, y1-10), 
                                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
 
-                    # УПРАВЛЕНИЕ 
+                    # УПРАВЛЕНИЕ И ПИД-РЕГУЛЯТОР
                     if self.robot_state.get('auto_mode', False):
                         if target_detected:
                             self.robot_state['auto_mode'] = False
@@ -421,11 +409,44 @@ current_time = time.time()
                             def _brake(car=self.car):
                                 car.stop()
                             threading.Thread(target=_brake, daemon=True).start()
+                            
+                            # Сброс ПИД при остановке
+                            self.pid_integral = 0.0
+                            self.pid_last_error = 0.0
+                            
                         elif target_x is not None and target_z > 0:
                             error = math.atan2(target_x, target_z)
-                            steer_k = self.config.kp_gain  # <--- Теперь рулит по kp_gain
-                            steering = max(-1.0, min(1.0, error * steer_k))
+                            
+                            # Расчет дельты времени для ПИД
+                            dt = current_time - self.last_pid_time
+                            if dt <= 0.0:
+                                dt = 0.03
+                                
+                            # I-компонента
+                            self.pid_integral += error * dt
+                            max_i = self.config.max_integral
+                            self.pid_integral = max(-max_i, min(max_i, self.pid_integral))
+                            
+                            # D-компонента
+                            derivative = (error - self.pid_last_error) / dt
+                            
+                            # Итоговый расчет руля
+                            steering = (self.config.kp_gain * error + 
+                                        self.config.ki_gain * self.pid_integral + 
+                                        self.config.kd_gain * derivative)
+                            
+                            max_s = self.config.max_steering_output
+                            steering = max(-max_s, min(max_s, steering))
+                            
+                            self.pid_last_error = error
                             self.car.update(1.0, steering)
+                        else:
+                            # Сброс ПИД, если не видим цель
+                            self.pid_integral = 0.0
+                            self.pid_last_error = 0.0
+                            self.car.update(1.0, 0.0)
+                            
+                        self.last_pid_time = current_time
 
                 # FPS 
                 fps_counter += 1
@@ -544,6 +565,11 @@ def main():
                     if not robot_state['auto_mode']:
                         robot_state['auto_mode'] = True
                         robot_state['msg'] = ''
+                        
+                        # Сброс ПИД при переходе в авторежим
+                        loop.pid_integral = 0.0
+                        loop.pid_last_error = 0.0
+                        
                 elif command == "S":
                     if robot_state['auto_mode']:
                         robot_state['auto_mode'] = False
@@ -553,30 +579,24 @@ def main():
                 elif command == "C":
                     loop.is_recording = False
                 elif command == "F":
-                    # ПЕРЕЗАГРУЗКА: отключение и повторное включение системы
                     robot_state['auto_mode'] = False
                     robot_state['msg'] = 'ПЕРЕЗАГРУЗКА...'
                     robot_state['msg_time'] = time.time()
                     logger.info("Инициирована перезагрузка системы...")
                     
-                    # Отключение Arduino
                     car.close()
                     time.sleep(0.5)
                     
-                    # Отключение камеры
                     loop.close()
                     time.sleep(0.5)
                     
-                    # Повторное включение Arduino
                     car.restart()
                     time.sleep(0.5)
                     
-                    # Повторное включение камеры
                     robot_state['cam_connected'] = False
                     loop.restart()
                     time.sleep(1.0)
                     
-                    # Обновляем статусы подключения
                     robot_state['cam_connected'] = loop.robot_state.get('cam_connected', False)
                     robot_state['arduino_connected'] = car.arduino is not None
                     robot_state['msg'] = 'СИСТЕМА ПЕРЕЗАГРУЖЕНА!'
@@ -602,7 +622,6 @@ def main():
                 if time.time() - robot_state['msg_time'] > config.message_clear_timeout:
                     robot_state['msg'] = ''
                 
-                # Обновляем статус подключения Arduino
                 robot_state['arduino_connected'] = car.arduino is not None
                 
                 telemetry = {

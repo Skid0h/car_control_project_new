@@ -28,8 +28,8 @@ class ConeDetector:
                    frame,
                    conf=self.config.confidence_threshold,
                    iou=self.config.iou_threshold,
-                   verbose=False,
-                   device=self.device,
+                   half=True,          # ← ДОБАвлено! FP16 на Xavier = x2-3 FPS
+                   imgsz=320,          # ← ДОБАвлено! Меньше = быстрее (было ~480x270)
                )
 
            detections = []

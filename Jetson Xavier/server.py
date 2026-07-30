@@ -203,35 +203,52 @@ class VisionLoop:
             if grab_result == sl.ERROR_CODE.SUCCESS:
                 self.zed.retrieve_image(image_zed, sl.VIEW.LEFT)
                 
+if grab_result == sl.ERROR_CODE.SUCCESS:
+                self.zed.retrieve_image(image_zed, sl.VIEW.LEFT)
                 img_data = image_zed.get_data()
+
+                # === ОПТИМИЗИРОВАННЫЙ CUDA-КОНВЕЙЕР ===
                 if CUDA_AVAILABLE and img_data.shape[2] == 4:
+                    # 1. Загружаем исходник на GPU ОДИН РАЗ
                     gpu_src = cv2.cuda_GpuMat()
                     gpu_src.upload(img_data)
-                    image_np = cv2.cuda.cvtColor(gpu_src, cv2.COLOR_BGRA2BGR).download()
-                elif img_data.shape[2] == 4:
-                    image_np = cv2.cvtColor(img_data, cv2.COLOR_BGRA2BGR)
-                else:
-                    image_np = img_data
-
-                detect_frame = image_np.copy()
-                if detect_frame.shape[1] > 640 or detect_frame.shape[0] > 480:
-                    target_width = 480
-                    target_height = 270
-                    scale = min(1.0, target_width / detect_frame.shape[1], target_height / detect_frame.shape[0])
+                    
+                    # 2. Конвертируем цвет прямо на видеокарте
+                    gpu_bgr = cv2.cuda.cvtColor(gpu_src, cv2.COLOR_BGRA2BGR)
+                    
+                    # 3. Вычисляем размеры
+                    target_width, target_height = 480, 270
+                    scale = min(1.0, target_width / img_data.shape[1], target_height / img_data.shape[0])
+                    
                     if scale < 1.0:
-                        new_w = max(320, int(detect_frame.shape[1] * scale))
-                        new_h = max(180, int(detect_frame.shape[0] * scale))
-                        if CUDA_AVAILABLE:
-                            gpu_img = cv2.cuda_GpuMat()
-                            gpu_img.upload(detect_frame)
-                            detect_frame = cv2.cuda.resize(gpu_img, (new_w, new_h)).download()
-                        else:
-                            detect_frame = cv2.resize(detect_frame, (new_w, new_h), interpolation=cv2.INTER_AREA)
-
-                # --- ROI: Игнорируем верхние 30% ---
-                crop_top = int(detect_frame.shape[0] * 0.30)
-                if crop_top > 0:
-                    detect_frame[:crop_top, :] = 0  # Заливаем верх черным
+                        new_w = max(320, int(img_data.shape[1] * scale))
+                        new_h = max(180, int(img_data.shape[0] * scale))
+                        
+                        # 4. Ресайз тоже делаем на видеокарте
+                        gpu_resized = cv2.cuda.resize(gpu_bgr, (new_w, new_h))
+                        
+                        # 5. Скачиваем готовые результаты в оперативку
+                        detect_frame = gpu_resized.download()  # Маленький кадр для быстрой YOLO
+                        image_np = gpu_bgr.download()          # Большой кадр для Web/Записи
+                    else:
+                        image_np = gpu_bgr.download()
+                        detect_frame = image_np
+                else:
+                    # Fallback для процессора (если CUDA отвалится)
+                    if img_data.shape[2] == 4:
+                        image_np = cv2.cvtColor(img_data, cv2.COLOR_BGRA2BGR)
+                    else:
+                        image_np = img_data
+                        
+                    detect_frame = image_np.copy()
+                    if image_np.shape[1] > 640 or image_np.shape[0] > 480:
+                        target_width, target_height = 480, 270
+                        scale = min(1.0, target_width / image_np.shape[1], target_height / image_np.shape[0])
+                        if scale < 1.0:
+                            new_w = max(320, int(image_np.shape[1] * scale))
+                            new_h = max(180, int(image_np.shape[0] * scale))
+                            detect_frame = cv2.resize(image_np, (new_w, new_h), interpolation=cv2.INTER_AREA)
+                # ======================================
 
                 self.frame_counter += 1
                 should_process = (self.frame_counter % self.process_every) == 0

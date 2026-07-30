@@ -42,6 +42,10 @@ class VisionLoop:
         self.detector = detector
         self.car = car
         self.robot_state = robot_state
+        self.detect_queue = queue.Queue(maxsize=1)
+        self.result_queue = queue.Queue(maxsize=1)
+        self.detect_thread = threading.Thread(target=self._detect_loop, daemon=True)
+        self.detect_thread.start()
 
         self.zed = sl.Camera()
         self.running = True
@@ -76,6 +80,22 @@ class VisionLoop:
 
         self.vision_thread = threading.Thread(target=self._vision_loop, daemon=True)
         self.vision_thread.start()
+
+    def _detect_loop(self):
+        """Отдельный поток для YOLO — не блокирует grab()"""
+        while self.running:
+            try:
+                frame = self.detect_queue.get(timeout=0.5)
+            except queue.Empty:
+                continue
+            detections = self.detector.detect(frame)
+            # Не блокируем, если результат ещё не забрали
+            if self.result_queue.full():
+                try:
+                    self.result_queue.get_nowait()
+                except queue.Empty:
+                    pass
+            self.result_queue.put(detections)
 
     def _get_boundary_data(self, cones, z_targets):
         """Интерполяция X-координат с фильтрацией выбросов"""
@@ -202,44 +222,28 @@ class VisionLoop:
 
             if grab_result == sl.ERROR_CODE.SUCCESS:
                 self.zed.retrieve_image(image_zed, sl.VIEW.LEFT)
-                
-if grab_result == sl.ERROR_CODE.SUCCESS:
-                self.zed.retrieve_image(image_zed, sl.VIEW.LEFT)
                 img_data = image_zed.get_data()
 
                 # === ОПТИМИЗИРОВАННЫЙ CUDA-КОНВЕЙЕР ===
                 if CUDA_AVAILABLE and img_data.shape[2] == 4:
-                    # 1. Загружаем исходник на GPU ОДИН РАЗ
                     gpu_src = cv2.cuda_GpuMat()
                     gpu_src.upload(img_data)
-                    
-                    # 2. Конвертируем цвет прямо на видеокарте
                     gpu_bgr = cv2.cuda.cvtColor(gpu_src, cv2.COLOR_BGRA2BGR)
                     
-                    # 3. Вычисляем размеры
                     target_width, target_height = 480, 270
                     scale = min(1.0, target_width / img_data.shape[1], target_height / img_data.shape[0])
                     
                     if scale < 1.0:
                         new_w = max(320, int(img_data.shape[1] * scale))
                         new_h = max(180, int(img_data.shape[0] * scale))
-                        
-                        # 4. Ресайз тоже делаем на видеокарте
                         gpu_resized = cv2.cuda.resize(gpu_bgr, (new_w, new_h))
-                        
-                        # 5. Скачиваем готовые результаты в оперативку
-                        detect_frame = gpu_resized.download()  # Маленький кадр для быстрой YOLO
-                        image_np = gpu_bgr.download()          # Большой кадр для Web/Записи
+                        detect_frame = gpu_resized.download()
+                        image_np = gpu_bgr.download()
                     else:
                         image_np = gpu_bgr.download()
                         detect_frame = image_np
                 else:
-                    # Fallback для процессора (если CUDA отвалится)
-                    if img_data.shape[2] == 4:
-                        image_np = cv2.cvtColor(img_data, cv2.COLOR_BGRA2BGR)
-                    else:
-                        image_np = img_data
-                        
+                    image_np = cv2.cvtColor(img_data, cv2.COLOR_BGRA2BGR) if img_data.shape[2] == 4 else img_data
                     detect_frame = image_np.copy()
                     if image_np.shape[1] > 640 or image_np.shape[0] > 480:
                         target_width, target_height = 480, 270
@@ -248,66 +252,81 @@ if grab_result == sl.ERROR_CODE.SUCCESS:
                             new_w = max(320, int(image_np.shape[1] * scale))
                             new_h = max(180, int(image_np.shape[0] * scale))
                             detect_frame = cv2.resize(image_np, (new_w, new_h), interpolation=cv2.INTER_AREA)
-                # ======================================
 
                 self.frame_counter += 1
                 should_process = (self.frame_counter % self.process_every) == 0
 
+                # ==========================================================
+                # === 1. АСИНХРОННАЯ ДЕТЕКЦИЯ (ИСПРАВЛЕННАЯ ЛОГИКА) ===
+                # ==========================================================
+                # Всегда пытаемся забрать свежий результат, если он готов (каждый кадр!)
+                try:
+                    fresh_detections = self.result_queue.get_nowait()
+                    self.last_detections = fresh_detections
+                except queue.Empty:
+                    pass
+                
+                # Используем последние доступные детекции
                 detections = self.last_detections
-                waypoints_3d = self.last_waypoints_3d
-                target_x = self.last_target_x
-                target_z = self.last_target_z
-                target_detected = self.last_target_detected
 
+                # Если пришло время, отправляем новый кадр в очередь на обработку
                 if should_process:
-                    detections = self.detector.detect(detect_frame)
-                    if detect_frame is not image_np:
-                        scale_x = image_np.shape[1] / detect_frame.shape[1]
-                        scale_y = image_np.shape[0] / detect_frame.shape[0]
-                        for det in detections:
-                            x1, y1, x2, y2 = det['bbox']
-                            det['bbox'] = (
-                                int(x1 * scale_x),
-                                int(y1 * scale_y),
-                                int(x2 * scale_x),
-                                int(y2 * scale_y),
-                            )
-                            center = det.get('center')
-                            if center is not None:
-                                det['center'] = (int(center[0] * scale_x), int(center[1] * scale_y))
+                    if not self.detect_queue.full():
+                        self.detect_queue.put(detect_frame.copy())
 
-                    current_time = time.time()
-                    current_cones = []
+                # ==========================================================
+                # === 2. БЕЗОПАСНОЕ МАСШТАБИРОВАНИЕ КООРДИНАТ ===
+                # ==========================================================
+                # Масштабируем координаты под размер image_np для отрисовки и расчетов.
+                # ВАЖНО: Делаем это для копии, чтобы не испортить last_detections!
+                if len(detections) > 0 and detect_frame.shape[:2] != image_np.shape[:2]:
+                    scale_x = image_np.shape[1] / detect_frame.shape[1]
+                    scale_y = image_np.shape[0] / detect_frame.shape[0]
                     
-                    # 1. Сбор конусов только с текущего кадра (БЕЗ ПАМЯТИ)
+                    active_detections = []
                     for det in detections:
+                        scaled_det = det.copy()
                         x1, y1, x2, y2 = det['bbox']
-                        width = max(x2 - x1, 1)
-                        height = max(y2 - y1, 1)
-                        area = width * height
-                        
-                        z = self.config.area_depth_constant / math.sqrt(area)
-                        
-                        if self.config.min_depth < z <= self.config.max_depth:
-                            u, v = det['center']
-                            x_cam = (u - self.cx_cam) * z / self.fx
-                            cone_pos = (x_cam, z - self.config.camera_offset_z)
-                            det['pos_3d'] = cone_pos
-                            cone_name = det.get('name', '')
-                            
-                            current_cones.append({'name': cone_name, 'pos_3d': cone_pos})
-                            
-                            if self.config.draw_target_z:
-                                cv2.putText(image_np, f"Z:{z:.1f}m", (x1, y1-25), 
-                                           cv2.FONT_HERSHEY_SIMPLEX, 
-                                           self.config.z_text_scale, 
-                                           self.config.z_text_color, 
-                                           self.config.z_text_thickness)
+                        scaled_det['bbox'] = (
+                            int(x1 * scale_x), int(y1 * scale_y),
+                            int(x2 * scale_x), int(y2 * scale_y),
+                        )
+                        center = det.get('center')
+                        if center is not None:
+                            scaled_det['center'] = (int(center[0] * scale_x), int(center[1] * scale_y))
+                        active_detections.append(scaled_det)
+                else:
+                    active_detections = detections
 
-                    # 2. Сортировка свежих детекций по глубине
-                    blues = sorted([c['pos_3d'] for c in current_cones if c['name'] in self.config.blue_cones], key=lambda p: p[1])[:6]
-                    yellows = sorted([c['pos_3d'] for c in current_cones if c['name'] in self.config.yellow_cones], key=lambda p: p[1])[:6]
-                    orange_cones = [c for c in current_cones if c['name'] in self.config.orange_cones]
+                # ==========================================================
+                # === 3. ОБРАБОТКА И ОТРИСОВКА (используем active_detections) ===
+                # ==========================================================
+                current_time = time.time()
+                current_cones = []
+                
+                for det in active_detections:
+                    x1, y1, x2, y2 = det['bbox']
+                    width = max(x2 - x1, 1)
+                    height = max(y2 - y1, 1)
+                    area = width * height
+                    z = self.config.area_depth_constant / math.sqrt(area)
+                    
+                    if self.config.min_depth < z <= self.config.max_depth:
+                        u, v = det['center']
+                        x_cam = (u - self.cx_cam) * z / self.fx
+                        cone_pos = (x_cam, z - self.config.camera_offset_z)
+                        
+                        current_cones.append({'name': det.get('name', ''), 'pos_3d': cone_pos})
+                        
+                        if self.config.draw_target_z:
+                            cv2.putText(image_np, f"Z:{z:.1f}m", (x1, y1-25), 
+                                       cv2.FONT_HERSHEY_SIMPLEX, self.config.z_text_scale, 
+                                       self.config.z_text_color, self.config.z_text_thickness)
+
+                blues = sorted([c['pos_3d'] for c in current_cones if c['name'] in self.config.blue_cones], key=lambda p: p[1])[:6]
+                yellows = sorted([c['pos_3d'] for c in current_cones if c['name'] in self.config.yellow_cones], key=lambda p: p[1])[:6]
+                orange_cones = [c for c in current_cones if c['name'] in self.config.orange_cones]
+
 
                     # 3. Интерполяция траектории
                     centerline = []

@@ -224,7 +224,13 @@ class VisionLoop:
                 self.zed.retrieve_image(image_zed, sl.VIEW.LEFT)
                 img_data = image_zed.get_data()
 
-                # === ОПТИМИЗИРОВАННЫЙ CUDA-КОНВЕЙЕР ===
+# === ОПТИМИЗИРОВАННЫЙ CUDA-КОНВЕЙЕР ===
+                self.frame_counter += 1
+                should_process = (self.frame_counter % self.process_every) == 0
+                
+                detect_frame = None
+                detect_frame_shape = None
+
                 if CUDA_AVAILABLE and img_data.shape[2] == 4:
                     gpu_src = cv2.cuda_GpuMat()
                     gpu_src.upload(img_data)
@@ -234,54 +240,62 @@ class VisionLoop:
                     scale = min(1.0, target_width / img_data.shape[1], target_height / img_data.shape[0])
                     
                     if scale < 1.0:
-                        new_w = max(320, int(img_data.shape[1] * scale))
-                        new_h = max(180, int(img_data.shape[0] * scale))
-                        gpu_resized = cv2.cuda.resize(gpu_bgr, (new_w, new_h))
-                        detect_frame = gpu_resized.download()
+                        new_w = max(256, int(img_data.shape[1] * scale))
+                        new_h = max(144, int(img_data.shape[0] * scale))
+                        detect_frame_shape = (new_h, new_w)
+                        
+                        # Скачиваем уменьшенный кадр ТОЛЬКО если он пойдет в YOLO
+                        if should_process:
+                            gpu_resized = cv2.cuda.resize(gpu_bgr, (new_w, new_h))
+                            detect_frame = gpu_resized.download()
+                            
                         image_np = gpu_bgr.download()
                     else:
                         image_np = gpu_bgr.download()
-                        detect_frame = image_np
+                        detect_frame_shape = image_np.shape[:2]
+                        if should_process:
+                            detect_frame = image_np  # Ссылка, копирование не нужно
                 else:
                     image_np = cv2.cvtColor(img_data, cv2.COLOR_BGRA2BGR) if img_data.shape[2] == 4 else img_data
-                    detect_frame = image_np.copy()
+                    detect_frame_shape = image_np.shape[:2]
+                    
                     if image_np.shape[1] > 640 or image_np.shape[0] > 480:
                         target_width, target_height = 480, 270
                         scale = min(1.0, target_width / image_np.shape[1], target_height / image_np.shape[0])
                         if scale < 1.0:
-                            new_w = max(320, int(image_np.shape[1] * scale))
-                            new_h = max(180, int(image_np.shape[0] * scale))
-                            detect_frame = cv2.resize(image_np, (new_w, new_h), interpolation=cv2.INTER_AREA)
-
-                self.frame_counter += 1
-                should_process = (self.frame_counter % self.process_every) == 0
+                            new_w = max(256, int(image_np.shape[1] * scale))
+                            new_h = max(144, int(image_np.shape[0] * scale))
+                            detect_frame_shape = (new_h, new_w)
+                            if should_process:
+                                detect_frame = cv2.resize(image_np, (new_w, new_h), interpolation=cv2.INTER_AREA)
+                    elif should_process:
+                        # В крайнем случае копируем, если нет ресайза и мы на CPU (бывает редко)
+                        detect_frame = image_np.copy()
 
                 # ==========================================================
-                # === 1. АСИНХРОННАЯ ДЕТЕКЦИЯ (ИСПРАВЛЕННАЯ ЛОГИКА) ===
+                # === 1. АСИНХРОННАЯ ДЕТЕКЦИЯ ===
                 # ==========================================================
-                # Всегда пытаемся забрать свежий результат, если он готов (каждый кадр!)
                 try:
                     fresh_detections = self.result_queue.get_nowait()
                     self.last_detections = fresh_detections
                 except queue.Empty:
                     pass
                 
-                # Используем последние доступные детекции
                 detections = self.last_detections
 
-                # Если пришло время, отправляем новый кадр в очередь на обработку
-                if should_process:
+                if should_process and detect_frame is not None:
                     if not self.detect_queue.full():
-                        self.detect_queue.put(detect_frame.copy())
+                        # УБРАН .copy() - экономим процессорное время и память
+                        self.detect_queue.put(detect_frame)
 
                 # ==========================================================
                 # === 2. БЕЗОПАСНОЕ МАСШТАБИРОВАНИЕ КООРДИНАТ ===
                 # ==========================================================
-                # Масштабируем координаты под размер image_np для отрисовки и расчетов.
-                # ВАЖНО: Делаем это для копии, чтобы не испортить last_detections!
-                if len(detections) > 0 and detect_frame.shape[:2] != image_np.shape[:2]:
-                    scale_x = image_np.shape[1] / detect_frame.shape[1]
-                    scale_y = image_np.shape[0] / detect_frame.shape[0]
+                # Используем сохраненный detect_frame_shape вместо вызова .shape у кадра, 
+                # которого может не быть на этой итерации цикла
+                if len(detections) > 0 and detect_frame_shape != image_np.shape[:2]:
+                    scale_x = image_np.shape[1] / detect_frame_shape[1]
+                    scale_y = image_np.shape[0] / detect_frame_shape[0]
                     
                     active_detections = []
                     for det in detections:

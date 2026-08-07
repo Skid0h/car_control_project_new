@@ -81,16 +81,14 @@ class VisionLoop:
         self.vision_thread.start()
         
     def _detect_loop(self):
-        """Отдельный поток для YOLO — передает кадр и исходный размер для точной разметки"""
+        """Отдельный поток для YOLO — не блокирует grab()"""
         while self.running:
             try:
-                item = self.detect_queue.get(timeout=0.5)
+                frame = self.detect_queue.get(timeout=0.5)
             except queue.Empty:
                 continue
-                
-            frame, orig_shape = item
-            detections = self.detector.detect(frame, orig_shape=orig_shape)
-            
+            detections = self.detector.detect(frame)
+            # Не блокируем, если результат ещё не забрали
             if self.result_queue.full():
                 try:
                     self.result_queue.get_nowait()
@@ -195,7 +193,7 @@ class VisionLoop:
         grab_error_count = 0
         max_grab_errors = 5
 
-        logger.info("Автопилот запущен: Быстрая реакция + Без памяти.")
+        logger.info(f"Автопилот запущен: Быстрая реакция + Без памяти.")
 
         while self.running:
             try:
@@ -203,12 +201,14 @@ class VisionLoop:
                 
                 if grab_result != sl.ERROR_CODE.SUCCESS:
                     grab_error_count += 1
+                    
                     if grab_error_count >= max_grab_errors:
                         logger.error("Ошибка захвата кадра. Переподключение камеры...")
                         self.robot_state['cam_connected'] = False
                         self._reconnect_camera(init_params)
                         grab_error_count = 0
                         continue
+                    
                     time.sleep(0.1)
                     continue
                 
@@ -223,27 +223,52 @@ class VisionLoop:
                 self.zed.retrieve_image(image_zed, sl.VIEW.LEFT)
                 img_data = image_zed.get_data()
 
-                # === ОПТИМИЗИРОВАННЫЙ CUDA-КОНВЕЙЕР (ОДИН РЕСАЙЗ) ===
+                # === ОПТИМИЗИРОВАННЫЙ CUDA-КОНВЕЙЕР ===
                 self.frame_counter += 1
                 should_process = (self.frame_counter % self.process_every) == 0
                 
                 detect_frame = None
+                detect_frame_shape = None
 
                 if CUDA_AVAILABLE and img_data.shape[2] == 4:
                     gpu_src = cv2.cuda_GpuMat()
                     gpu_src.upload(img_data)
                     gpu_bgr = cv2.cuda.cvtColor(gpu_src, cv2.COLOR_BGRA2BGR)
                     
-                    image_np = gpu_bgr.download()
+                    # Увеличено до 640x360, чтобы не мылить картинку перед YOLO 640x640
+                    target_width, target_height = 640, 360
+                    scale = min(1.0, target_width / img_data.shape[1], target_height / img_data.shape[0])
                     
-                    if should_process:
-                        # Ресайз сразу до 640x640 прямо на GPU
-                        gpu_resized = cv2.cuda.resize(gpu_bgr, (640, 640))
-                        detect_frame = gpu_resized.download()
+                    if scale < 1.0:
+                        new_w = max(256, int(img_data.shape[1] * scale))
+                        new_h = max(144, int(img_data.shape[0] * scale))
+                        detect_frame_shape = (new_h, new_w)
+                        
+                        if should_process:
+                            gpu_resized = cv2.cuda.resize(gpu_bgr, (new_w, new_h))
+                            detect_frame = gpu_resized.download()
+                            
+                        image_np = gpu_bgr.download()
+                    else:
+                        image_np = gpu_bgr.download()
+                        detect_frame_shape = image_np.shape[:2]
+                        if should_process:
+                            detect_frame = image_np
                 else:
                     image_np = cv2.cvtColor(img_data, cv2.COLOR_BGRA2BGR) if img_data.shape[2] == 4 else img_data
-                    if should_process:
-                        detect_frame = cv2.resize(image_np, (640, 640), interpolation=cv2.INTER_LINEAR)
+                    detect_frame_shape = image_np.shape[:2]
+                    
+                    if image_np.shape[1] > 640 or image_np.shape[0] > 480:
+                        target_width, target_height = 640, 360
+                        scale = min(1.0, target_width / image_np.shape[1], target_height / image_np.shape[0])
+                        if scale < 1.0:
+                            new_w = max(256, int(image_np.shape[1] * scale))
+                            new_h = max(144, int(image_np.shape[0] * scale))
+                            detect_frame_shape = (new_h, new_w)
+                            if should_process:
+                                detect_frame = cv2.resize(image_np, (new_w, new_h), interpolation=cv2.INTER_AREA)
+                    elif should_process:
+                        detect_frame = image_np.copy()
 
                 # ==========================================================
                 # === 1. АСИНХРОННАЯ ДЕТЕКЦИЯ ===
@@ -254,14 +279,36 @@ class VisionLoop:
                 except queue.Empty:
                     pass
                 
-                active_detections = self.last_detections
+                detections = self.last_detections
 
                 if should_process and detect_frame is not None:
                     if not self.detect_queue.full():
-                        self.detect_queue.put((detect_frame, image_np.shape[:2]))
+                        self.detect_queue.put(detect_frame)
 
                 # ==========================================================
-                # === 2. ОБРАБОТКА И ОТРИСОВКА ===
+                # === 2. БЕЗОПАСНОЕ МАСШТАБИРОВАНИЕ КООРДИНАТ ===
+                # ==========================================================
+                if len(detections) > 0 and detect_frame_shape != image_np.shape[:2]:
+                    scale_x = image_np.shape[1] / detect_frame_shape[1]
+                    scale_y = image_np.shape[0] / detect_frame_shape[0]
+                    
+                    active_detections = []
+                    for det in detections:
+                        scaled_det = det.copy()
+                        x1, y1, x2, y2 = det['bbox']
+                        scaled_det['bbox'] = (
+                            int(x1 * scale_x), int(y1 * scale_y),
+                            int(x2 * scale_x), int(y2 * scale_y),
+                        )
+                        center = det.get('center')
+                        if center is not None:
+                            scaled_det['center'] = (int(center[0] * scale_x), int(center[1] * scale_y))
+                        active_detections.append(scaled_det)
+                else:
+                    active_detections = detections
+
+                # ==========================================================
+                # === 3. ОБРАБОТКА И ОТРИСОВКА ===
                 # ==========================================================
                 current_time = time.time()
                 current_cones = []
@@ -289,7 +336,7 @@ class VisionLoop:
                 yellows = sorted([c['pos_3d'] for c in current_cones if c['name'] in self.config.yellow_cones], key=lambda p: p[1])[:6]
                 orange_cones = [c for c in current_cones if c['name'] in self.config.orange_cones]
 
-                # Интерполяция траектории
+                # 3. Интерполяция траектории
                 centerline = []
                 half_track = self.config.track_width / 2.0
                 z_grid = np.arange(0.3, self.config.max_depth, 0.2)
@@ -324,7 +371,7 @@ class VisionLoop:
 
                 waypoints_3d = [{'x': cx, 'z': cz, 'type': 'centerline'} for cx, cz in centerline]
 
-                # ВЫБОР ЦЕЛИ (Lookahead)
+                # 4. ВЫБОР ЦЕЛИ (Lookahead)
                 lookahead_dist = self.config.lookahead_distance
                 target_wp = None
                 for cx, cz in centerline:
@@ -335,7 +382,7 @@ class VisionLoop:
                 if target_wp is None and len(centerline) > 0:
                     target_wp = centerline[-1]
 
-                # EMA Сглаживание целевой точки
+                # 5. EMA Сглаживание целевой точки
                 if target_wp is not None:
                     tx, tz = target_wp
                     alpha = getattr(self.config, 'ema_alpha', 0.85)
@@ -348,7 +395,7 @@ class VisionLoop:
                 target_x = self.smooth_tx
                 target_z = self.smooth_tz
 
-                # Проверка стоп-конуса
+                # 6. Проверка стоп-конуса
                 target_detected = False
                 if orange_cones:
                     stop_threshold = getattr(self.config, 'stop_cone_z_threshold', 0.5)
@@ -380,7 +427,7 @@ class VisionLoop:
 
                 # ОТРИСОВКА КОНУСОВ
                 if self.config.draw_detections and should_process:
-                    for det in active_detections:
+                    for det in detections:
                         x1, y1, x2, y2 = det['bbox']
                         cone_name = det.get('name', '')
                         
@@ -407,22 +454,27 @@ class VisionLoop:
                             car.stop()
                         threading.Thread(target=_brake, daemon=True).start()
                         
+                        # Сброс ПИД при остановке
                         self.pid_integral = 0.0
                         self.pid_last_error = 0.0
                         
                     elif target_x is not None and target_z > 0:
                         error = math.atan2(target_x, target_z)
                         
+                        # Расчет дельты времени для ПИД
                         dt = current_time - self.last_pid_time
                         if dt <= 0.0:
                             dt = 0.03
                             
+                        # I-компонента
                         self.pid_integral += error * dt
                         max_i = self.config.max_integral
                         self.pid_integral = max(-max_i, min(max_i, self.pid_integral))
                         
+                        # D-компонента
                         derivative = (error - self.pid_last_error) / dt
                         
+                        # Итоговый расчет руля
                         steering = (self.config.kp_gain * error + 
                                     self.config.ki_gain * self.pid_integral + 
                                     self.config.kd_gain * derivative)
@@ -433,6 +485,7 @@ class VisionLoop:
                         self.pid_last_error = error
                         self.car.update(1.0, steering)
                     else:
+                        # Сброс ПИД, если не видим цель
                         self.pid_integral = 0.0
                         self.pid_last_error = 0.0
                         self.car.update(1.0, 0.0)
@@ -477,10 +530,11 @@ class VisionLoop:
         self.robot_state['cam_connected'] = False
     
     def _reconnect_camera(self, init_params):
+        """Попытка переподключения к камере"""
         try:
             self.zed.close()
             time.sleep(0.5)
-        except Exception:
+        except Exception as e:
             pass
         
         try:
@@ -555,6 +609,8 @@ def main():
                     if not robot_state['auto_mode']:
                         robot_state['auto_mode'] = True
                         robot_state['msg'] = ''
+                        
+                        # Сброс ПИД при переходе в авторежим
                         loop.pid_integral = 0.0
                         loop.pid_last_error = 0.0
                         

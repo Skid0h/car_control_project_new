@@ -11,34 +11,29 @@ class ConeDetector:
         self.config = config
         self.class_id_to_name = {int(k): v for k, v in self.config.class_names.items()}
         
-        # Задаем размер, под который был скомпилирован .engine файл
+        # Размер, под который скомпилирован .engine файл
         self.imgsz = 640 
         self.cuda_ctx = None
         
         logger.info(f"Загрузка нативного TensorRT engine: {self.config.yolo_model_path}")
         
         try:
-            # 1. Инициализируем драйвер CUDA
             try:
                 cuda.init()
             except cuda.LogicError:
-                pass # Уже инициализировано
+                pass
             
             self.dev = cuda.Device(0)
             self.cuda_ctx = self.dev.make_context()
             
-            # 2. КРИТИЧЕСКИ ВАЖНО: Пушим контекст ПЕРЕД созданием execution context!
-            # Это привязывает внутренние ресурсы TensorRT именно к нашему PyCUDA контексту.
             self.cuda_ctx.push()
             
             self.trt_logger = trt.Logger(trt.Logger.WARNING)
             self.engine = self._load_engine(self.config.yolo_model_path)
             
-            # 3. Создаем execution context (теперь он валиден)
             self.context = self.engine.create_execution_context()
             self.inputs, self.outputs, self.bindings, self.stream = self._allocate_buffers(self.engine)
             
-            # 4. Убираем контекст из стека главного потока
             self.cuda_ctx.pop()
             
             logger.info("TensorRT Runtime успешно инициализирован!")
@@ -50,7 +45,6 @@ class ConeDetector:
                 except: pass
 
     def __del__(self):
-        """Гарантированное очищение стека контекстов при завершении программы"""
         if self.cuda_ctx:
             try:
                 self.cuda_ctx.synchronize()
@@ -82,28 +76,31 @@ class ConeDetector:
                 outputs.append({'host': host_mem, 'device': device_mem, 'name': name, 'shape': engine.get_binding_shape(i)})
         return inputs, outputs, bindings, stream
 
-    def detect(self, frame):
+    def detect(self, frame, orig_shape=None):
         if self.engine is None or frame is None:
             return []
             
-        orig_h, orig_w = frame.shape[:2]
+        h, w = frame.shape[:2]
+        orig_h, orig_w = orig_shape if orig_shape else (h, w)
         
         # ==========================================
         # 1. ПРЕ-ПРОЦЕССИНГ (CPU)
         # ==========================================
-        img = cv2.resize(frame, (self.imgsz, self.imgsz))
+        # Ресайз выполняется только если кадр еще не 640x640
+        if h != self.imgsz or w != self.imgsz:
+            img = cv2.resize(frame, (self.imgsz, self.imgsz))
+        else:
+            img = frame
+            
         img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-        img = img.astype(np.float32) / 255.0
-        img = np.transpose(img, (2, 0, 1)) 
-        np.copyto(self.inputs[0]['host'], img.ravel())
+        blob = np.ascontiguousarray(img.transpose(2, 0, 1), dtype=np.float32) / 255.0
+        np.copyto(self.inputs[0]['host'], blob.ravel())
         
         # ==========================================
         # 2. ИНФЕРЕНС (GPU)
         # ==========================================
-        # Пушим контекст в рабочем потоке
         self.cuda_ctx.push()
         try:
-            # Для explicit batch engine ОБЯЗАТЕЛЬНО задаем shape
             self.context.set_binding_shape(0, (1, 3, self.imgsz, self.imgsz))
             
             cuda.memcpy_htod_async(self.inputs[0]['device'], self.inputs[0]['host'], self.stream)
@@ -112,8 +109,8 @@ class ConeDetector:
             self.stream.synchronize()
         except Exception as e:
             logger.error(f"Ошибка инференса TRT: {e}")
+            return []
         finally:
-            # Всегда убираем контекст, даже если была ошибка
             self.cuda_ctx.pop()
 
         # ==========================================
@@ -122,8 +119,7 @@ class ConeDetector:
         output_data = self.outputs[0]['host']
         out_shape = self.outputs[0]['shape'] 
         
-        output_data = output_data.reshape(out_shape) 
-        output_data = output_data[0].T 
+        output_data = output_data.reshape(out_shape)[0].T 
         
         boxes_raw = output_data[:, :4]
         scores_raw = output_data[:, 4:]
@@ -138,14 +134,16 @@ class ConeDetector:
         if len(boxes_raw) == 0:
             return []
             
+        # Прямой пересчет под исходный размер кадра display_image
         x_scale = orig_w / self.imgsz
         y_scale = orig_h / self.imgsz
+        
         boxes_nms = []
-        for (cx, cy, w, h) in boxes_raw:
-            x = (cx - w / 2) * x_scale
-            y = (cy - h / 2) * y_scale
-            bw = w * x_scale
-            bh = h * y_scale
+        for (cx, cy, bw_raw, bh_raw) in boxes_raw:
+            x = (cx - bw_raw / 2) * x_scale
+            y = (cy - bh_raw / 2) * y_scale
+            bw = bw_raw * x_scale
+            bh = bh_raw * y_scale
             boxes_nms.append([int(x), int(y), int(bw), int(bh)])
             
         indices = cv2.dnn.NMSBoxes(

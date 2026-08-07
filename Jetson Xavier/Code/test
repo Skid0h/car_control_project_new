@@ -1,53 +1,13 @@
-import pyzed.sl as sl
-import time
-
-def run_barebones_test():
-    zed = sl.Camera()
-    init_params = sl.InitParameters()
-    
-    # Жестко форсируем настройки, игнорируя config.jsonc
-    init_params.camera_resolution = sl.RESOLUTION.HD720
-    init_params.camera_fps = 60
-    init_params.depth_mode = sl.DEPTH_MODE.NONE
-    
-    print("Открываем ZED камеру...")
-    if zed.open(init_params) != sl.ERROR_CODE.SUCCESS:
-        print("Ошибка: Не удалось открыть камеру. Проверь USB.")
-        return
-
-    runtime_params = sl.RuntimeParameters()
-    print("Камера открыта! Начинаем замер чистого FPS (только grab)...")
-
-    frames = 0
-    start_time = time.time()
-
-    while True:
-        t0 = time.perf_counter()
-        
-        # Получаем кадр
-        err = zed.grab(runtime_params)
-        
-        t1 = time.perf_counter()
-        
-        if err == sl.ERROR_CODE.SUCCESS:
-            frames += 1
-            
-        grab_ms = (t1 - t0) * 1000
-        
-        # Выводим скорость grab() раз в 10 кадров
-        if frames % 10 == 0:
-            print(f"Время zed.grab(): {grab_ms:.2f} мс")
-
-        # Каждую секунду считаем итоговый FPS
-        if time.time() - start_time >= 1.0:
-            print(f"=====================================")
-            print(f"РЕАЛЬНЫЙ FPS ЖЕЛЕЗА: {frames}")
-            print(f"=====================================")
-            frames = 0
-            start_time = time.time()
-
-if __name__ == "__main__":
-    try:
-        run_barebones_test()
-    except KeyboardInterrupt:
-        print("Тест завершен.")
+РЕАЛЬНЫЙ FPS ЖЕЛЕЗА: 61
+=====================================
+Время zed.grab(): 16.33 мс
+Время zed.grab(): 16.66 мс
+Время zed.grab(): 16.57 мс
+Время zed.grab(): 16.62 мс
+Время zed.grab(): 16.64 мс
+Время zed.grab(): 16.40 мс
+=====================================
+РЕАЛЬНЫЙ FPS ЖЕЛЕЗА: 60
+=====================================
+Время zed.grab(): 16.56 мс
+Время zed.grab(): 16.82 мс

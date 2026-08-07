@@ -1,7 +1,6 @@
 """
-Запускается на Jetson.
-АЛГОРИТМ: Мгновенный отклик, интерполяция границ трассы, без памяти конусов.
-ФАЙЛ КОНФИГУРАЦИИ. ПОМЕХОЗАЩИЩЕННЫЙ UART.
+Тестовый server.py с закомментированными блоками для пошаговой диагностики FPS.
+Оставлены только: Захват ZED, Веб-стрим (set_frame) и счетчик FPS.
 """
 
 import socket
@@ -43,7 +42,6 @@ class VisionLoop:
         self.car = car
         self.robot_state = robot_state
         
-        # --- АТРИБУТЫ ДО ЗАПУСКА ПОТОКОВ ---
         self.running = True
         self.is_recording = False
         self.frame_counter = 0
@@ -65,7 +63,6 @@ class VisionLoop:
         if not os.path.exists(self.config.output_folder):
             os.makedirs(self.config.output_folder)
         
-        # --- ОЧЕРЕДИ И ПОТОКИ ---
         self.detect_queue = queue.Queue(maxsize=1)
         self.result_queue = queue.Queue(maxsize=1)
         self.detect_thread = threading.Thread(target=self._detect_loop, daemon=True)
@@ -81,7 +78,6 @@ class VisionLoop:
         self.vision_thread.start()
         
     def _detect_loop(self):
-        """Отдельный поток для YOLO — передает кадр и исходный размер для точной разметки"""
         while self.running:
             try:
                 item = self.detect_queue.get(timeout=0.5)
@@ -99,21 +95,16 @@ class VisionLoop:
             self.result_queue.put(detections)
 
     def _get_boundary_data(self, cones, z_targets):
-        """Интерполяция X-координат с фильтрацией выбросов"""
         valid_cones = [c for c in cones if abs(c[0]) < 2.5]
-        
         if not valid_cones:
             return None, 999.0, -1.0
-            
         z_vals = [c[1] for c in valid_cones]
         x_vals = [c[0] for c in valid_cones]
         min_z, max_z = min(z_vals), max(z_vals)
-        
         if len(valid_cones) == 1:
             bound_x = np.full_like(z_targets, x_vals[0])
         else:
             bound_x = np.interp(z_targets, z_vals, x_vals, left=x_vals[0], right=x_vals[-1])
-            
         return bound_x, min_z, max_z
 
     def _rec_loop(self):
@@ -189,29 +180,23 @@ class VisionLoop:
         fps_counter = 0
         current_fps = 0
         fps_last_time = time.time()
-        rec_timestamp = None
-        was_recording = False
 
         grab_error_count = 0
         max_grab_errors = 5
 
-        logger.info("Автопилот запущен: Быстрая реакция + Без памяти.")
-
         while self.running:
             try:
                 grab_result = self.zed.grab(runtime_params)
-                
                 if grab_result != sl.ERROR_CODE.SUCCESS:
                     grab_error_count += 1
                     if grab_error_count >= max_grab_errors:
-                        logger.error("Ошибка захвата кадра. Переподключение камеры...")
+                        logger.error("Ошибка захвата кадра.")
                         self.robot_state['cam_connected'] = False
                         self._reconnect_camera(init_params)
                         grab_error_count = 0
                         continue
                     time.sleep(0.1)
                     continue
-                
                 grab_error_count = 0
             except Exception as e:
                 logger.error(f"Исключение при grab(): {e}")
@@ -223,139 +208,76 @@ class VisionLoop:
                 self.zed.retrieve_image(image_zed, sl.VIEW.LEFT)
                 img_data = image_zed.get_data()
 
-                # === ОПТИМИЗИРОВАННЫЙ CUDA-КОНВЕЙЕР (ОДИН РЕСАЙЗ) ===
                 self.frame_counter += 1
                 should_process = (self.frame_counter % self.process_every) == 0
-                
-                detect_frame = None
 
+                # ==========================================================
+                # === ШАГ 2: ШИНА ПАМЯТИ CUDA (ОТКЛЮЧЕНА) ===
+                # ==========================================================
+                """
                 if CUDA_AVAILABLE and img_data.shape[2] == 4:
                     gpu_src = cv2.cuda_GpuMat()
                     gpu_src.upload(img_data)
                     gpu_bgr = cv2.cuda.cvtColor(gpu_src, cv2.COLOR_BGRA2BGR)
-                    
                     image_np = gpu_bgr.download()
-                    
                     if should_process:
-                        # Ресайз сразу до 640x640 прямо на GPU
                         gpu_resized = cv2.cuda.resize(gpu_bgr, (640, 640))
                         detect_frame = gpu_resized.download()
                 else:
                     image_np = cv2.cvtColor(img_data, cv2.COLOR_BGRA2BGR) if img_data.shape[2] == 4 else img_data
                     if should_process:
                         detect_frame = cv2.resize(image_np, (640, 640), interpolation=cv2.INTER_LINEAR)
+                """
+                # Временно используем стандартное преобразование CPU:
+                image_np = cv2.cvtColor(img_data, cv2.COLOR_BGRA2BGR) if img_data.shape[2] == 4 else img_data
+                detect_frame = None
 
                 # ==========================================================
-                # === 1. АСИНХРОННАЯ ДЕТЕКЦИЯ ===
+                # === ШАГ 1: ИНФЕРЕНС YOLO (ОТКЛЮЧЕН) ===
                 # ==========================================================
+                """
                 try:
                     fresh_detections = self.result_queue.get_nowait()
                     self.last_detections = fresh_detections
                 except queue.Empty:
                     pass
-                
                 active_detections = self.last_detections
 
                 if should_process and detect_frame is not None:
                     if not self.detect_queue.full():
                         self.detect_queue.put((detect_frame, image_np.shape[:2]))
+                """
+                active_detections = []
 
                 # ==========================================================
-                # === 2. ОБРАБОТКА И ОТРИСОВКА ===
+                # === ШАГ 3: МАТЕМАТИКА ТРАЕКТОРИИ И ГЛУБИН (ОТКЛЮЧЕНА) ===
                 # ==========================================================
+                """
                 current_time = time.time()
                 current_cones = []
-                
                 for det in active_detections:
                     x1, y1, x2, y2 = det['bbox']
                     width = max(x2 - x1, 1)
                     height = max(y2 - y1, 1)
                     area = width * height
                     z = self.config.area_depth_constant / math.sqrt(area)
-                    
                     if self.config.min_depth < z <= self.config.max_depth:
                         u, v = det['center']
                         x_cam = (u - self.cx_cam) * z / self.fx
                         cone_pos = (x_cam, z - self.config.camera_offset_z)
-                        
                         current_cones.append({'name': det.get('name', ''), 'pos_3d': cone_pos})
-                        
-                        if self.config.draw_target_z:
-                            cv2.putText(image_np, f"Z:{z:.1f}m", (x1, y1-25), 
-                                       cv2.FONT_HERSHEY_SIMPLEX, self.config.z_text_scale, 
-                                       self.config.z_text_color, self.config.z_text_thickness)
 
                 blues = sorted([c['pos_3d'] for c in current_cones if c['name'] in self.config.blue_cones], key=lambda p: p[1])[:6]
                 yellows = sorted([c['pos_3d'] for c in current_cones if c['name'] in self.config.yellow_cones], key=lambda p: p[1])[:6]
-                orange_cones = [c for c in current_cones if c['name'] in self.config.orange_cones]
-
-                # Интерполяция траектории
-                centerline = []
-                half_track = self.config.track_width / 2.0
-                z_grid = np.arange(0.3, self.config.max_depth, 0.2)
-                
                 left_bound_x, l_min_z, l_max_z = self._get_boundary_data(blues, z_grid)
                 right_bound_x, r_min_z, r_max_z = self._get_boundary_data(yellows, z_grid)
-                
-                for i, z in enumerate(z_grid):
-                    lx = left_bound_x[i] if left_bound_x is not None else None
-                    rx = right_bound_x[i] if right_bound_x is not None else None
-                    
-                    valid_l = lx is not None and (l_min_z - 0.4 <= z <= l_max_z + 0.4)
-                    valid_r = rx is not None and (r_min_z - 0.4 <= z <= r_max_z + 0.4)
-                    
-                    if valid_l and valid_r:
-                        cx = (lx + rx) / 2.0
-                    elif valid_l:
-                        cx = lx + half_track
-                    elif valid_r:
-                        cx = rx - half_track
-                    else:
-                        if lx is not None and rx is not None:
-                            cx = (lx + rx) / 2.0
-                        elif lx is not None:
-                            cx = lx + half_track
-                        elif rx is not None:
-                            cx = rx - half_track
-                        else:
-                            cx = 0.0 
-                            
-                    centerline.append((cx, z))
+                """
+                target_x, target_z = None, None
 
-                waypoints_3d = [{'x': cx, 'z': cz, 'type': 'centerline'} for cx, cz in centerline]
-
-                # ВЫБОР ЦЕЛИ (Lookahead)
-                lookahead_dist = self.config.lookahead_distance
-                target_wp = None
-                for cx, cz in centerline:
-                    if cz >= lookahead_dist:
-                        target_wp = (cx, cz)
-                        break
-                        
-                if target_wp is None and len(centerline) > 0:
-                    target_wp = centerline[-1]
-
-                # EMA Сглаживание целевой точки
-                if target_wp is not None:
-                    tx, tz = target_wp
-                    alpha = getattr(self.config, 'ema_alpha', 0.85)
-                    self.smooth_tx = self.smooth_tx + alpha * (tx - self.smooth_tx)
-                    self.smooth_tz = self.smooth_tz + alpha * (tz - self.smooth_tz)
-                else:
-                    decay = getattr(self.config, 'error_decay_rate', 0.5)
-                    self.smooth_tx *= decay
-
-                target_x = self.smooth_tx
-                target_z = self.smooth_tz
-
-                # Проверка стоп-конуса
-                target_detected = False
-                if orange_cones:
-                    stop_threshold = getattr(self.config, 'stop_cone_z_threshold', 0.5)
-                    if any(oc['pos_3d'][1] <= stop_threshold for oc in orange_cones):
-                        target_detected = True
-
-                # ОТРИСОВКА ТРАЕКТОРИИ
+                # ==========================================================
+                # === ШАГ 4: ОТРИСОВКА ОВЕРЛЕЕВ (ОТКЛЮЧЕНА) ===
+                # ==========================================================
+                """
                 if self.config.draw_trajectory and should_process:
                     pts_2d = [[image_np.shape[1]//2, image_np.shape[0]]]
                     for wp in waypoints_3d:
@@ -368,121 +290,39 @@ class VisionLoop:
                                      color=self.config.trajectory_color, 
                                      thickness=self.config.trajectory_thickness)
 
-                # ОТРИСОВКА ЦЕЛИ
-                if target_x is not None and target_z > 0:
-                    if self.config.draw_target:
-                        target_u = int((target_x * self.fx / target_z) + self.cx_cam)
-                        target_v = int(image_np.shape[0] * self.config.cone_base_v)
-                        cv2.drawMarker(image_np, (target_u, target_v), (0, 0, 255), 
-                                      cv2.MARKER_CROSS, 
-                                      self.config.target_cross_size, 
-                                      self.config.target_cross_thickness)
-
-                # ОТРИСОВКА КОНУСОВ
                 if self.config.draw_detections and should_process:
                     for det in active_detections:
                         x1, y1, x2, y2 = det['bbox']
-                        cone_name = det.get('name', '')
-                        
-                        if cone_name in self.config.blue_cones:
-                            color = (255, 0, 0)
-                        elif cone_name in self.config.yellow_cones:
-                            color = (0, 255, 255)
-                        elif cone_name in self.config.orange_cones:
-                            color = (0, 165, 255)
-                        else:
-                            color = (255, 255, 255)
-                        
-                        cv2.rectangle(image_np, (x1, y1), (x2, y2), color, 2)
-                        cv2.putText(image_np, cone_name, (x1, y1-10), 
-                                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+                        cv2.rectangle(image_np, (x1, y1), (x2, y2), (255, 0, 0), 2)
+                """
 
-                # УПРАВЛЕНИЕ И ПИД-РЕГУЛЯТОР
-                if self.robot_state.get('auto_mode', False):
-                    if target_detected:
-                        self.robot_state['auto_mode'] = False
-                        self.robot_state['msg'] = "ФИНИШ! ОРАНЖЕВЫЙ КОНУС."
-                        self.robot_state['msg_time'] = time.time()
-                        def _brake(car=self.car):
-                            car.stop()
-                        threading.Thread(target=_brake, daemon=True).start()
-                        
-                        self.pid_integral = 0.0
-                        self.pid_last_error = 0.0
-                        
-                    elif target_x is not None and target_z > 0:
-                        error = math.atan2(target_x, target_z)
-                        
-                        dt = current_time - self.last_pid_time
-                        if dt <= 0.0:
-                            dt = 0.03
-                            
-                        self.pid_integral += error * dt
-                        max_i = self.config.max_integral
-                        self.pid_integral = max(-max_i, min(max_i, self.pid_integral))
-                        
-                        derivative = (error - self.pid_last_error) / dt
-                        
-                        steering = (self.config.kp_gain * error + 
-                                    self.config.ki_gain * self.pid_integral + 
-                                    self.config.kd_gain * derivative)
-                        
-                        max_s = self.config.max_steering_output
-                        steering = max(-max_s, min(max_s, steering))
-                        
-                        self.pid_last_error = error
-                        self.car.update(1.0, steering)
-                    else:
-                        self.pid_integral = 0.0
-                        self.pid_last_error = 0.0
-                        self.car.update(1.0, 0.0)
-                        
-                    self.last_pid_time = current_time
-
-                # FPS 
+                # ==========================================================
+                # === ДИАГНОСТИЧЕСКИЙ ВЫВОД: СЧЕТЧИК FPS И ВЕБ-СТРИМ ===
+                # ==========================================================
                 fps_counter += 1
                 if time.time() - fps_last_time >= self.config.fps_update_interval:
                     current_fps = fps_counter
                     fps_counter = 0
                     fps_last_time = time.time()
                 
-                if self.config.draw_fps:
-                    cv2.putText(image_np, f"FPS: {current_fps} Mode: {'AUTO' if self.robot_state.get('auto_mode') else 'MANUAL'}", 
-                               (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 
-                               self.config.fps_text_scale, self.config.fps_text_color, self.config.fps_text_thickness)
-                if target_x is not None and self.config.draw_target_z:
-                    cv2.putText(image_np, f"Target Z: {target_z:.2f}m", (10, 85), cv2.FONT_HERSHEY_SIMPLEX, 
-                               self.config.target_z_text_scale, self.config.target_z_text_color, self.config.target_z_text_thickness)
-                
-                # ЗАПИСЬ
-                if self.is_recording:
-                    if self.config.draw_rec:
-                        cv2.putText(image_np, "REC", (10, 55), cv2.FONT_HERSHEY_SIMPLEX,
-                                   self.config.rec_text_scale, self.config.rec_text_color, self.config.rec_text_thickness)
-                    if not was_recording:
-                        rec_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                        was_recording = True
-                    if not self.rec_queue.full():
-                        self.rec_queue.put((image_np.copy(), rec_timestamp))
-                else:
-                    if was_recording:
-                        self.rec_queue.put(None)
-                        was_recording = False
+                # Текст прямо на видеокадре для контроля в браузере
+                cv2.putText(image_np, f"TEST MODE - FPS: {current_fps}", 
+                           (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 
+                           1.0, (0, 255, 0), 2)
 
-                # ОТПРАВКА НА WEB
+                # Публикация картинки на Web
                 if self.frame_counter % self.publish_every == 0:
                     set_frame(image_np)
 
         self.zed.close()
         self.robot_state['cam_connected'] = False
-    
+
     def _reconnect_camera(self, init_params):
         try:
             self.zed.close()
             time.sleep(0.5)
         except Exception:
             pass
-        
         try:
             self.zed = sl.Camera()
             if self.zed.open(init_params) == sl.ERROR_CODE.SUCCESS:
@@ -519,9 +359,16 @@ class VisionLoop:
         self.fx = 0
         self.cx_cam = 0
         self.zed = sl.Camera()
+        
+        self.detect_queue = queue.Queue(maxsize=1)
+        self.result_queue = queue.Queue(maxsize=1)
+        self.detect_thread = threading.Thread(target=self._detect_loop, daemon=True)
+        self.detect_thread.start()
+        
         self.rec_queue = queue.Queue(maxsize=30)
         self.rec_thread = threading.Thread(target=self._rec_loop, daemon=True)
         self.rec_thread.start()
+        
         self.vision_thread = threading.Thread(target=self._vision_loop, daemon=True)
         self.vision_thread.start()
 
@@ -557,7 +404,6 @@ def main():
                         robot_state['msg'] = ''
                         loop.pid_integral = 0.0
                         loop.pid_last_error = 0.0
-                        
                 elif command == "S":
                     if robot_state['auto_mode']:
                         robot_state['auto_mode'] = False
@@ -570,26 +416,19 @@ def main():
                     robot_state['auto_mode'] = False
                     robot_state['msg'] = 'ПЕРЕЗАГРУЗКА...'
                     robot_state['msg_time'] = time.time()
-                    logger.info("Инициирована перезагрузка системы...")
-                    
                     car.close()
                     time.sleep(0.5)
-                    
                     loop.close()
                     time.sleep(0.5)
-                    
                     car.restart()
                     time.sleep(0.5)
-                    
                     robot_state['cam_connected'] = False
                     loop.restart()
                     time.sleep(1.0)
-                    
                     robot_state['cam_connected'] = loop.robot_state.get('cam_connected', False)
                     robot_state['arduino_connected'] = car.arduino is not None
                     robot_state['msg'] = 'СИСТЕМА ПЕРЕЗАГРУЖЕНА!'
                     robot_state['msg_time'] = time.time()
-                    logger.info("Система успешно перезагружена!")
                 elif command.startswith("speed:"):
                     try:
                         fwd, bck = map(int, command[6:].split(','))
@@ -632,7 +471,6 @@ def main():
         loop.close()
         car.close()
         sock.close()
-
 
 if __name__ == "__main__":
     main()

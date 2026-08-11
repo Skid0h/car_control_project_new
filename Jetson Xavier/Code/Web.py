@@ -8,8 +8,6 @@ app = Flask(__name__)
 # Сюда будет записываться кадр из основного кода
 current_frame = None
 frame_lock = threading.Lock()
-# Флаг, который будет сообщать циклу, что приехал свежий кадр
-new_frame_event = threading.Event() 
 
 HTML = """
 <!DOCTYPE html>
@@ -34,8 +32,6 @@ def set_frame(frame):
     with frame_lock:
         if frame is not None:
             current_frame = frame.copy()
-            # Даем сигнал генератору, что кадр обновился
-            new_frame_event.set()
 
 @app.route('/')
 def index():
@@ -45,21 +41,14 @@ def index():
 def video():
     def generate():
         while True:
-            # Спим и ждем, пока set_frame не вызовет new_frame_event.set()
-            # Это освобождает 99% ресурсов процессора!
-            new_frame_event.wait()
-            # Сбрасываем флаг обратно, чтобы уснуть на следующем круге
-            new_frame_event.clear()
-            
             with frame_lock:
                 if current_frame is not None:
                     frame = current_frame.copy()
                 else:
+                    # Если кадра нет, показываем чёрный экран
                     frame = np.zeros((480, 640, 3), dtype=np.uint8)
             
-            # Чуть снизил качество JPEG с 80 до 70. Разницы глазом не увидишь, 
-            # а процессору станет еще легче.
-            ret, jpeg = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 70])
+            ret, jpeg = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
             if ret:
                 yield (b'--frame\r\n'
                        b'Content-Type: image/jpeg\r\n\r\n' + jpeg.tobytes() + b'\r\n')
@@ -68,10 +57,5 @@ def video():
 
 def start():
     """Запуск веб-сервера в отдельном потоке"""
-    # Добавил подавление стандартных логов Flask, чтобы они не засоряли консоль
-    import logging
-    log = logging.getLogger('werkzeug')
-    log.setLevel(logging.ERROR)
-    
     threading.Thread(target=lambda: app.run(host='0.0.0.0', port=5000, threaded=True), daemon=True).start()
     print("Web server started on port 5000")

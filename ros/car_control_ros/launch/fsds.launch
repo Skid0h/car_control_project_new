@@ -1,0 +1,24 @@
+<launch>
+  <arg name="perception" default="ground_truth" doc="ground_truth or camera"/>
+  <arg name="auto_start" default="false"/>
+  <arg name="model_path" default=""/>
+  <arg name="image_topic" default="/fsds/camera/cam1"/>
+  <arg name="camera_info_topic" default="/fsds/camera/cam1/camera_info"/>
+  <arg name="controller_config" default="$(find car_control_ros)/config/fsds.yaml"/>
+  <param name="use_sim_time" value="false"/>
+  <node pkg="car_control_ros" type="controller_node.py" name="car_controller" output="screen" required="true">
+    <param name="auto_start" value="$(arg auto_start)"/>
+    <rosparam command="load" file="$(arg controller_config)"/>
+  </node>
+  <node pkg="car_control_ros" type="fsds_node.py" name="fsds_adapter" output="screen" required="true">
+    <param name="ground_truth" value="$(eval {'ground_truth': True, 'camera': False}[arg('perception')])"/>
+    <param name="require_go" value="true"/>
+    <param name="max_depth" value="15.0"/>
+  </node>
+  <node if="$(eval arg('perception') == 'camera')" pkg="car_control_ros" type="vision_node.py" name="car_vision" output="screen" required="true">
+    <param name="model_path" value="$(arg model_path)"/>
+    <rosparam command="load" file="$(find car_control_ros)/config/fsds_camera.yaml"/>
+    <remap from="~image" to="$(arg image_topic)"/>
+    <remap from="~camera_info" to="$(arg camera_info_topic)"/>
+  </node>
+</launch>

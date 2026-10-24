@@ -1,0 +1,8 @@
+# For upstream master settings.json cam1 (785x785, 90deg FOV, aligned).
+horizontal_fov_deg: 90.0
+camera_forward: -0.3
+camera_left: 0.16
+sensor_timeout: 0.4
+# Starting estimate only. Calibrate: constant = known distance * sqrt(bbox area).
+# Different resolution / cone size means a different constant.
+area_depth_constant: 300.0

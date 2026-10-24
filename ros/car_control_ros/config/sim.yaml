@@ -1,0 +1,5 @@
+# Geometry/gains come from Jetson Xavier/config.jsonc unless overridden here.
+sensor_timeout: 0.4
+controller:
+  throttle: 0.25
+  stop_on_orange: true

@@ -1,0 +1,21 @@
+<?xml version="1.0"?>
+<package format="2">
+  <name>car_control_ros</name>
+  <version>0.1.0</version>
+  <description>Cone controller, lightweight simulator and optional FSDS adapter.</description>
+  <maintainer email="salimadze2005-beep@users.noreply.github.com">Project maintainers</maintainer>
+  <license>Proprietary</license>
+  <buildtool_depend>catkin</buildtool_depend>
+  <build_depend>message_generation</build_depend>
+  <exec_depend>message_runtime</exec_depend>
+  <depend>rospy</depend>
+  <depend>std_msgs</depend>
+  <depend>std_srvs</depend>
+  <depend>geometry_msgs</depend>
+  <depend>sensor_msgs</depend>
+  <depend>nav_msgs</depend>
+  <depend>visualization_msgs</depend>
+  <exec_depend>cv_bridge</exec_depend>
+  <exec_depend>python3-rospkg</exec_depend>
+  <test_depend>rostest</test_depend>
+</package>

@@ -1,0 +1,6 @@
+<launch>
+  <node pkg="car_control_ros" type="controller_node.py" name="car_controller" output="screen">
+    <param name="auto_start" value="true"/>
+  </node>
+  <test test-name="ros_watchdog" pkg="car_control_ros" type="ros_watchdog.py" time-limit="30"/>
+</launch>

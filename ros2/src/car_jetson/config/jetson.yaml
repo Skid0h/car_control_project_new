@@ -1,0 +1,20 @@
+car_control:
+  ros__parameters:
+    dry_run: true
+    sensor_timeout: 0.4
+    link_timeout: 0.5
+    actuator.rate_hz: 20.0
+    actuator.deadband_deg: 2.0
+    actuator.slew_deg_s: 60.0
+    actuator.heartbeat_s: 0.2
+    actuator.command_timeout_s: 0.3
+    # Starting limits ONLY: calibrate with wheels lifted before driving.
+    actuator.steering_min: 70
+    actuator.steering_max: 130
+    controller.throttle: 0.25
+car_vision:
+  ros__parameters:
+    sensor_timeout: 0.4
+    preprocess: stretch
+    # Right-positive lateral offset. 0 preserves legacy server geometry.
+    camera_right: 0.0

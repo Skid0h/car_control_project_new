@@ -1,0 +1,78 @@
+// Native ROS 2 configuration. Pass model_path at launch.
+{
+  "network": {
+    "udp_ip": "0.0.0.0",
+    "udp_port": 5005
+  },
+  "car": {
+    "baud_rate": 9600,
+    "neutral_speed": 1500,
+    "forward_speed": 1570,
+    "back_speed": 1420,
+    "center_steering": 100,
+    "steering_range": 50
+  },
+  "pid": {
+    "kp_gain": 1.0,
+    "ki_gain": 0.1,
+    "kd_gain": 0.25,
+    "max_integral": 1.5,
+    "ema_alpha": 0.85,
+    "max_steering_output": 1.0,
+    "min_dt": 0.001
+  },
+  "autopilot": {
+    "max_depth": 4.0,
+    "min_depth": 0.1,
+    "track_width": 1.5,
+    "lookahead_distance": 0.5,
+    "stop_cone_z_threshold": 0.5,
+    "area_depth_constant": 100.0
+  },
+  "vision": {
+    "yolo_model_path": "",
+    "confidence_threshold": 0.5,
+    "iou_threshold": 0.5,
+    "target_fps": 15.0,
+    "camera_offset_z": 0.1,
+    "zed_resolution": "HD720",
+    "zed_fps": 15
+  },
+  "detection": {
+    "cone_colors": {
+      "yellow": [
+        0,
+        255,
+        255
+      ],
+      "orange": [
+        0,
+        165,
+        255
+      ],
+      "blue": [
+        255,
+        0,
+        0
+      ]
+    },
+    "class_names": {
+      "0": "yellow",
+      "1": "orange",
+      "2": "blue"
+    },
+    "blue_cones": [
+      "blue"
+    ],
+    "yellow_cones": [
+      "yellow"
+    ],
+    "orange_cones": [
+      "orange"
+    ]
+  },
+  "timing": {
+    "arduino_init_delay": 2.0,
+    "arduino_post_stop_delay": 0.5
+  }
+}

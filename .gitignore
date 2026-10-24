@@ -1,9 +1,0 @@
-__pycache__/
-*.pyc
-.idea/
-.vscode/
-models/
-# Log files
-*.log
-car_control.log
-car_control.log.*

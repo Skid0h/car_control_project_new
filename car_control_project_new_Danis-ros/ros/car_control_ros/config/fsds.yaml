@@ -1,0 +1,14 @@
+# Initial LOW SPEED values for the full-size virtual car; tune on your track.
+# Do not transfer the 1.5m miniature track / 0.5m lookahead to a Formula car.
+sensor_timeout: 0.4
+controller:
+  track_width: 3.0
+  lookahead_distance: 5.0
+  min_depth: 0.1
+  max_depth: 15.0
+  lateral_limit: 12.0
+  kp_gain: 1.0
+  ki_gain: 0.0
+  kd_gain: 0.05
+  throttle: 0.08
+  stop_on_orange: false

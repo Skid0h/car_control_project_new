@@ -1,0 +1,4 @@
+<launch>
+  <include file="$(find car_control_ros)/launch/sim.launch"/>
+  <test test-name="ros_smoke" pkg="car_control_ros" type="ros_smoke.py" time-limit="35"/>
+</launch>

@@ -1,14 +1,10 @@
 """
 Запускается на Jetson.
 Исправленная версия server.py
-Фиксы записи:
-простой рекордер без выравнивания по таймстампам (нет ускорений/слоу-мо):
-продюсер децимирует кадры до rec_fps, консьюмер пишет каждый полученный кадр,
-длительность файла = записанные_кадры / rec_fps
-кадр сразу копируется из буфера SDK (нет рваных кадров)
-убран setpts-хак ffmpeg, конвертация = простой транскод
-дедупликация детекций (нет двойных рамок)
-конусы и траектория рисуются каждый кадр
+Фиксы:
+1. Ограничение FPS до 30 (камера и обработка).
+2. Машина стоит и крест пропадает, если не видит конусы (жесткий сброс target_x).
+3. Исправлены все синтаксические ошибки (рваные пробелы в переменных).
 """
 import socket
 import time
@@ -40,14 +36,10 @@ logger = logging.getLogger(__name__)
 
 config = Config("config.jsonc")
 
-# Диагностика через переменные окружения:
-# DISABLE_WEB=1    -> не запускать Web и не отправлять кадры
-# FORCE_HD720_60=1 -> форсировать HD720 60 FPS
-# USE_CUDA=1       -> включить CUDA-конвейер
+# Диагностика через переменные окружения
 DISABLE_WEB = os.environ.get("DISABLE_WEB", "0") == "1"
 FORCE_HD720_60 = os.environ.get("FORCE_HD720_60", "0") == "1"
 USE_CUDA = os.environ.get("USE_CUDA", "0") == "1" and CUDA_AVAILABLE
-
 
 class VisionLoop:
     def __init__(self, config, detector, car, robot_state):
@@ -60,13 +52,15 @@ class VisionLoop:
         self.running = True
         self.is_recording = False
         self.frame_counter = 0
-
-        target_fps = float(getattr(self.config, "target_fps", self.config.zed_fps))
+        
+        # ФИКС 1: Жестко ограничиваем целевой FPS до 30
+        target_fps = 30.0 
+        
         self.process_every = max(
             1,
             int(round(self.config.zed_fps / max(1.0, target_fps)))
         )
-
+        
         publish_fps = float(getattr(self.config, "publish_fps", 0.0) or 0.0)
         if publish_fps <= 0:
             publish_fps = float(getattr(self.config, "web_fps", 0.0) or 0.0)
@@ -78,10 +72,9 @@ class VisionLoop:
         else:
             self.publish_every = max(1, self.process_every)
 
-        # ФИКС: запись децимируется до rec_fps на входе в очередь
         self.rec_fps = int(getattr(self.config, "rec_fps", 30))
         self.rec_every = max(1, int(round(self.config.zed_fps / self.rec_fps)))
-
+        
         logger.info(
             f"FPS SETTINGS: zed_fps={self.config.zed_fps}, "
             f"target_fps={target_fps}, "
@@ -113,7 +106,6 @@ class VisionLoop:
         self.detect_thread.start()
 
         self.zed = sl.Camera()
-
         rec_queue_size = int(getattr(self.config, "rec_queue_size", 120))
         self.rec_queue = queue.Queue(maxsize=rec_queue_size)
         self.rec_thread = threading.Thread(target=self._rec_loop, daemon=True)
@@ -135,6 +127,7 @@ class VisionLoop:
             except Exception as e:
                 logger.error(f"Ошибка детектора: {e}")
                 detections = []
+            
             if self.result_queue.full():
                 try:
                     self.result_queue.get_nowait()
@@ -168,17 +161,14 @@ class VisionLoop:
             bound_x = np.full_like(z_targets, x_vals[0], dtype=float)
         else:
             bound_x = np.interp(
-                z_targets,
-                z_vals,
-                x_vals,
-                left=x_vals[0],
-                right=x_vals[-1]
+                z_targets, z_vals, x_vals,
+                left=x_vals[0], right=x_vals[-1]
             )
         return bound_x, min_z, max_z
 
     @staticmethod
     def _dedup_detections(dets, min_dist=25):
-        """Убирает дубликаты одного конуса (одинаковый класс, центр рядом)."""
+        """Убирает дубликаты одного конуса"""
         kept = []
         for det in sorted(dets, key=lambda d: -float(d.get('conf', 0.0))):
             cx, cy = det.get('center', (0, 0))
@@ -194,13 +184,6 @@ class VisionLoop:
         return kept
 
     def _rec_loop(self):
-        """
-        ФИКС: простой поток записи без выравнивания по таймстампам.
-        Продюсер уже децимирует кадры до rec_fps, здесь пишем КАЖДЫЙ
-        полученный кадр. Длительность файла = written / rec_fps, то есть
-        равна реальной, пока писатель успевает (нет ускорений и прыжков).
-        Единственная метрика здоровья — rec_dropped_frames на продюсере.
-        """
         video_writer = None
         temp_video_path = None
         final_video_path = None
@@ -231,6 +214,7 @@ class VisionLoop:
                 continue
             if not self.running and video_writer is None:
                 break
+
             frame, file_ts = item
             if video_writer is None:
                 temp_video_path = os.path.join(
@@ -243,12 +227,7 @@ class VisionLoop:
                 )
                 h, w = frame.shape[:2]
                 fourcc = cv2.VideoWriter_fourcc(*self.config.temp_codec)
-                video_writer = cv2.VideoWriter(
-                    temp_video_path,
-                    fourcc,
-                    fps,
-                    (w, h)
-                )
+                video_writer = cv2.VideoWriter(temp_video_path, fourcc, fps, (w, h))
                 if not video_writer.isOpened():
                     logger.error("Не удалось открыть VideoWriter для записи.")
                     video_writer = None
@@ -260,11 +239,9 @@ class VisionLoop:
             video_writer.release()
 
     def _convert_video(self, input_path, output_path):
-        """Простой транскод без изменения таймингов — тайминги уже ровные."""
         try:
             cmd = [
-                'ffmpeg',
-                '-i', input_path,
+                'ffmpeg', '-i', input_path,
                 '-c:v', self.config.output_codec,
                 '-preset', self.config.output_preset,
                 '-crf', str(self.config.output_crf),
@@ -287,37 +264,43 @@ class VisionLoop:
 
     def _vision_loop(self):
         init_params = sl.InitParameters()
+        
+        # ФИКС 1: Принудительно ставим 30 FPS для камеры
         if FORCE_HD720_60:
             init_params.camera_resolution = sl.RESOLUTION.HD720
-            init_params.camera_fps = 60
+            init_params.camera_fps = 30 
         else:
             init_params.camera_resolution = getattr(
                 sl.RESOLUTION,
                 self.config.zed_resolution,
                 sl.RESOLUTION.HD720
             )
-            init_params.camera_fps = int(self.config.zed_fps)
+            init_params.camera_fps = 30 
+            
         init_params.coordinate_units = getattr(
             sl.UNIT,
             self.config.coordinate_units,
             sl.UNIT.METER
         )
-        # глубина не используется — отключаем полностью
         init_params.depth_mode = sl.DEPTH_MODE.NONE
+        
         if self.zed.open(init_params) != sl.ERROR_CODE.SUCCESS:
             logger.error("Не удалось открыть ZED-камеру.")
             self.robot_state['cam_connected'] = False
             self.running = False
             return
+        
         self.robot_state['cam_connected'] = True
         cam_info = self.zed.get_camera_information()
         self.fx = cam_info.camera_configuration.calibration_parameters.left_cam.fx
         self.cx_cam = cam_info.camera_configuration.calibration_parameters.left_cam.cx
+        
         runtime_params = sl.RuntimeParameters()
         try:
             runtime_params.enable_depth = False
         except Exception:
             pass
+            
         image_zed = sl.Mat()
         fps_counter = 0
         current_fps = 0.0
@@ -326,9 +309,11 @@ class VisionLoop:
         was_recording = False
         grab_error_count = 0
         max_grab_errors = 5
+        
         logger.info("Автопилот запущен: Быстрая реакция + Без памяти.")
         logger.info(f"CUDA pipeline enabled: {USE_CUDA}")
         logger.info(f"Web disabled: {DISABLE_WEB}")
+        
         while self.running:
             try:
                 grab_result = self.zed.grab(runtime_params)
@@ -341,9 +326,7 @@ class VisionLoop:
                         grab_error_count = 0
                         continue
                     else:
-                        logger.warning(
-                            f"ZED grab failed: {grab_result}, count={grab_error_count}"
-                        )
+                        logger.warning(f"ZED grab failed: {grab_result}, count={grab_error_count}")
                     time.sleep(0.1)
                     continue
                 grab_error_count = 0
@@ -352,34 +335,29 @@ class VisionLoop:
                 self.robot_state['cam_connected'] = False
                 time.sleep(0.5)
                 continue
+
             self.frame_counter += 1
             should_process = (self.frame_counter % self.process_every) == 0
             need_publish = (self.frame_counter % self.publish_every) == 0
+            
             if self.zed.retrieve_image(image_zed, sl.VIEW.LEFT) != sl.ERROR_CODE.SUCCESS:
                 continue
+                
             img_data = image_zed.get_data()
             if img_data is None:
                 logger.warning("image_zed.get_data() вернул None, кадр пропущен")
                 continue
-            # ФИКС: сразу своя копия — дальше работаем только с ней.
-            # Иначе SDK перезапишет буфер следующим grab() прямо во время
-            # cvtColor/отрисовки -> рваные кадры и «призраки».
+            
             img_data = img_data.copy()
             detect_frame = None
             detect_frame_shape = None
-            # ==========================================================
-            # === КОНВЕЙЕР ПОЛУЧЕНИЯ BGR-КАДРА ===
-            # ==========================================================
+
             if USE_CUDA and len(img_data.shape) == 3 and img_data.shape[2] == 4:
                 gpu_src = cv2.cuda_GpuMat()
                 gpu_src.upload(img_data)
                 gpu_bgr = cv2.cuda.cvtColor(gpu_src, cv2.COLOR_BGRA2BGR)
                 target_width, target_height = 640, 360
-                scale = min(
-                    1.0,
-                    target_width / img_data.shape[1],
-                    target_height / img_data.shape[0]
-                )
+                scale = min(1.0, target_width / img_data.shape[1], target_height / img_data.shape[0])
                 if scale < 1.0:
                     new_w = max(256, int(img_data.shape[1] * scale))
                     new_h = max(144, int(img_data.shape[0] * scale))
@@ -395,33 +373,22 @@ class VisionLoop:
                         detect_frame = image_np
             else:
                 if len(img_data.shape) == 3 and img_data.shape[2] == 4:
-                    # безопасно: конвертируем уже из своей копии
                     image_np = cv2.cvtColor(img_data, cv2.COLOR_BGRA2BGR)
                 else:
-                    image_np = img_data  # уже своя копия
+                    image_np = img_data
                 detect_frame_shape = image_np.shape[:2]
                 target_width, target_height = 640, 360
                 if image_np.shape[1] > target_width or image_np.shape[0] > target_height:
-                    scale = min(
-                        1.0,
-                        target_width / image_np.shape[1],
-                        target_height / image_np.shape[0]
-                    )
+                    scale = min(1.0, target_width / image_np.shape[1], target_height / image_np.shape[0])
                     new_w = max(256, int(image_np.shape[1] * scale))
                     new_h = max(144, int(image_np.shape[0] * scale))
                     detect_frame_shape = (new_h, new_w)
                     if should_process:
-                        detect_frame = cv2.resize(
-                            image_np,
-                            (new_w, new_h),
-                            interpolation=cv2.INTER_AREA
-                        )
+                        detect_frame = cv2.resize(image_np, (new_w, new_h), interpolation=cv2.INTER_AREA)
                 else:
                     if should_process:
                         detect_frame = image_np
-            # ==========================================================
-            # === 1. АСИНХРОННАЯ ДЕТЕКЦИЯ ===
-            # ==========================================================
+
             while True:
                 try:
                     fresh_detections, fresh_shape = self.result_queue.get_nowait()
@@ -432,6 +399,7 @@ class VisionLoop:
                     break
                 except Exception:
                     break
+                    
             detections = self.last_detections
             if should_process and detect_frame is not None:
                 if not self.detect_queue.full():
@@ -439,43 +407,24 @@ class VisionLoop:
                         self.detect_queue.put_nowait(detect_frame)
                     except queue.Full:
                         pass
-            # ==========================================================
-            # === 2. МАСШТАБИРОВАНИЕ КООРДИНАТ + ДЕДУПЛИКАЦИЯ ===
-            # ==========================================================
+
             active_detections = detections
-            detection_source_shape = (
-                self.last_detect_frame_shape
-                if self.last_detect_frame_shape is not None
-                else detect_frame_shape
-            )
-            if (
-                len(detections) > 0 and
-                detection_source_shape is not None and
-                detection_source_shape != image_np.shape[:2]
-            ):
+            detection_source_shape = self.last_detect_frame_shape if self.last_detect_frame_shape is not None else detect_frame_shape
+            if (len(detections) > 0 and detection_source_shape is not None and detection_source_shape != image_np.shape[:2]):
                 scale_x = image_np.shape[1] / float(detection_source_shape[1])
                 scale_y = image_np.shape[0] / float(detection_source_shape[0])
                 active_detections = []
                 for det in detections:
                     scaled_det = det.copy()
                     x1, y1, x2, y2 = det['bbox']
-                    scaled_det['bbox'] = (
-                        int(x1 * scale_x),
-                        int(y1 * scale_y),
-                        int(x2 * scale_x),
-                        int(y2 * scale_y),
-                    )
+                    scaled_det['bbox'] = (int(x1 * scale_x), int(y1 * scale_y), int(x2 * scale_x), int(y2 * scale_y))
                     center = det.get('center')
                     if center is not None:
-                        scaled_det['center'] = (
-                            int(center[0] * scale_x),
-                            int(center[1] * scale_y)
-                        )
+                        scaled_det['center'] = (int(center[0] * scale_x), int(center[1] * scale_y))
                     active_detections.append(scaled_det)
+            
             active_detections = self._dedup_detections(active_detections)
-            # ==========================================================
-            # === 3. ОБРАБОТКА И ОТРИСОВКА ===
-            # ==========================================================
+
             current_time = time.time()
             current_cones = []
             for det in active_detections:
@@ -488,40 +437,26 @@ class VisionLoop:
                     u, v = det['center']
                     x_cam = (u - self.cx_cam) * z / self.fx
                     cone_pos = (x_cam, z - self.config.camera_offset_z)
-                    current_cones.append({
-                        'name': det.get('name', ''),
-                        'pos_3d': cone_pos
-                    })
+                    current_cones.append({'name': det.get('name', ''), 'pos_3d': cone_pos})
                     if self.config.draw_target_z:
-                        cv2.putText(
-                            image_np,
-                            f"Z:{z:.1f}m",
-                            (x1, y1 - 25),
-                            cv2.FONT_HERSHEY_SIMPLEX,
-                            self.config.z_text_scale,
-                            self.config.z_text_color,
-                            self.config.z_text_thickness
-                        )
-            blues = sorted(
-                [c['pos_3d'] for c in current_cones if c['name'] in self.config.blue_cones],
-                key=lambda p: p[1]
-            )[:6]
-            yellows = sorted(
-                [c['pos_3d'] for c in current_cones if c['name'] in self.config.yellow_cones],
-                key=lambda p: p[1]
-            )[:6]
+                        cv2.putText(image_np, f"Z:{z:.1f}m", (x1, y1 - 25), cv2.FONT_HERSHEY_SIMPLEX, self.config.z_text_scale, self.config.z_text_color, self.config.z_text_thickness)
+
+            blues = sorted([c['pos_3d'] for c in current_cones if c['name'] in self.config.blue_cones], key=lambda p: p[1])[:6]
+            yellows = sorted([c['pos_3d'] for c in current_cones if c['name'] in self.config.yellow_cones], key=lambda p: p[1])[:6]
             orange_cones = [c for c in current_cones if c['name'] in self.config.orange_cones]
-            # Интерполяция траектории
+
             centerline = []
             half_track = self.config.track_width / 2.0
             z_grid = np.arange(0.3, self.config.max_depth, 0.2)
             left_bound_x, l_min_z, l_max_z = self._get_boundary_data(blues, z_grid)
             right_bound_x, r_min_z, r_max_z = self._get_boundary_data(yellows, z_grid)
+            
             for i, z in enumerate(z_grid):
                 lx = left_bound_x[i] if left_bound_x is not None else None
                 rx = right_bound_x[i] if right_bound_x is not None else None
                 valid_l = lx is not None and (l_min_z - 0.4 <= z <= l_max_z + 0.4)
                 valid_r = rx is not None and (r_min_z - 0.4 <= z <= r_max_z + 0.4)
+                
                 if valid_l and valid_r:
                     cx = (lx + rx) / 2.0
                 elif valid_l:
@@ -538,11 +473,9 @@ class VisionLoop:
                     else:
                         cx = 0.0
                 centerline.append((cx, z))
-            waypoints_3d = [
-                {'x': cx, 'z': cz, 'type': 'centerline'}
-                for cx, cz in centerline
-            ]
-            # Выбор цели (Lookahead)
+
+            waypoints_3d = [{'x': cx, 'z': cz, 'type': 'centerline'} for cx, cz in centerline]
+
             lookahead_dist = self.config.lookahead_distance
             target_wp = None
             for cx, cz in centerline:
@@ -551,24 +484,28 @@ class VisionLoop:
                     break
             if target_wp is None and len(centerline) > 0:
                 target_wp = centerline[-1]
-            # EMA сглаживание целевой точки
+
+            # ФИКС 2: EMA сглаживание целевой точки + ЖЕСТКИЙ СБРОС ПРИ ПОТЕРЕ ЦЕЛИ
             if target_wp is not None:
                 tx, tz = target_wp
                 alpha = getattr(self.config, 'ema_alpha', 0.85)
                 self.smooth_tx = self.smooth_tx + alpha * (tx - self.smooth_tx)
                 self.smooth_tz = self.smooth_tz + alpha * (tz - self.smooth_tz)
+                target_x = self.smooth_tx
+                target_z = self.smooth_tz
             else:
-                decay = getattr(self.config, 'error_decay_rate', 0.5)
-                self.smooth_tx *= decay
-            target_x = self.smooth_tx
-            target_z = self.smooth_tz
-            # Проверка стоп-конуса
+                # Если конусов нет, обнуляем всё. Крест исчезнет, машина встанет.
+                self.smooth_tx = 0.0
+                self.smooth_tz = 0.0
+                target_x = None
+                target_z = 0.0
+
             target_detected = False
             if orange_cones:
                 stop_threshold = getattr(self.config, 'stop_cone_z_threshold', 0.5)
                 if any(oc['pos_3d'][1] <= stop_threshold for oc in orange_cones):
                     target_detected = True
-            # Отрисовка траектории — КАЖДЫЙ кадр
+
             if self.config.draw_trajectory:
                 pts_2d = [[image_np.shape[1] // 2, image_np.shape[0]]]
                 for wp in waypoints_3d:
@@ -577,27 +514,15 @@ class VisionLoop:
                     pts_2d.append([u, v])
                 if len(pts_2d) > 1:
                     pts_arr = np.array(pts_2d, np.int32).reshape((-1, 1, 2))
-                    cv2.polylines(
-                        image_np,
-                        [pts_arr],
-                        isClosed=False,
-                        color=self.config.trajectory_color,
-                        thickness=self.config.trajectory_thickness
-                    )
-            # Отрисовка цели
+                    cv2.polylines(image_np, [pts_arr], isClosed=False, color=self.config.trajectory_color, thickness=self.config.trajectory_thickness)
+
+            # Крест рисуется ТОЛЬКО если есть реальная цель
             if target_x is not None and target_z > 0:
                 if self.config.draw_target:
                     target_u = int((target_x * self.fx / target_z) + self.cx_cam)
                     target_v = int(image_np.shape[0] * self.config.cone_base_v)
-                    cv2.drawMarker(
-                        image_np,
-                        (target_u, target_v),
-                        (0, 0, 255),
-                        cv2.MARKER_CROSS,
-                        self.config.target_cross_size,
-                        self.config.target_cross_thickness
-                    )
-            # Отрисовка конусов — КАЖДЫЙ кадр
+                    cv2.drawMarker(image_np, (target_u, target_v), (0, 0, 255), cv2.MARKER_CROSS, self.config.target_cross_size, self.config.target_cross_thickness)
+
             if self.config.draw_detections:
                 for det in active_detections:
                     x1, y1, x2, y2 = det['bbox']
@@ -611,102 +536,77 @@ class VisionLoop:
                     else:
                         color = (255, 255, 255)
                     cv2.rectangle(image_np, (x1, y1), (x2, y2), color, 2)
-                    cv2.putText(
-                        image_np,
-                        cone_name,
-                        (x1, y1 - 10),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.5,
-                        color,
-                        2
-                    )
+                    cv2.putText(image_np, cone_name, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+
             # Управление и ПИД-регулятор
             if self.robot_state.get('auto_mode', False):
                 if target_detected:
                     self.robot_state['auto_mode'] = False
                     self.robot_state['msg'] = "ФИНИШ! ОРАНЖЕВЫЙ КОНУС."
                     self.robot_state['msg_time'] = time.time()
-
                     def _brake(car=self.car):
                         try:
                             car.stop()
                         except Exception as e:
                             logger.error(f"Ошибка торможения: {e}")
-
                     threading.Thread(target=_brake, daemon=True).start()
                     self.pid_integral = 0.0
                     self.pid_last_error = 0.0
+                
                 elif target_x is not None and target_z > 0:
                     error = math.atan2(target_x, target_z)
                     dt = current_time - self.last_pid_time
                     if dt <= 0.0:
                         dt = 0.03
+                    
                     self.pid_integral += error * dt
                     max_i = self.config.max_integral
                     self.pid_integral = max(-max_i, min(max_i, self.pid_integral))
+                    
                     derivative = (error - self.pid_last_error) / dt
                     steering = (
                         self.config.kp_gain * error +
                         self.config.ki_gain * self.pid_integral +
                         self.config.kd_gain * derivative
                     )
+                    
                     max_s = self.config.max_steering_output
                     steering = max(-max_s, min(max_s, steering))
+                    
                     self.pid_last_error = error
                     try:
                         self.car.update(1.0, steering)
                     except Exception as e:
                         logger.error(f"Ошибка car.update(): {e}")
+                
+                # ФИКС 2: Если цели нет -> СТОИМ (Газ 0.0)
                 else:
                     self.pid_integral = 0.0
                     self.pid_last_error = 0.0
                     try:
-                        self.car.update(1.0, 0.0)
+                        self.car.update(0.0, 0.0)
                     except Exception as e:
                         logger.error(f"Ошибка car.update(): {e}")
+                
                 self.last_pid_time = current_time
-            # FPS
+
             fps_counter += 1
             elapsed_fps_time = time.time() - fps_last_time
             if elapsed_fps_time >= self.config.fps_update_interval:
                 current_fps = fps_counter / max(elapsed_fps_time, 1e-6)
                 fps_counter = 0
                 fps_last_time = time.time()
+            
             if self.config.draw_fps:
                 mode_txt = 'AUTO' if self.robot_state.get('auto_mode') else 'MANUAL'
-                cv2.putText(
-                    image_np,
-                    f"FPS: {current_fps:.1f} Mode: {mode_txt}",
-                    (10, 30),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    self.config.fps_text_scale,
-                    self.config.fps_text_color,
-                    self.config.fps_text_thickness
-                )
+                cv2.putText(image_np, f"FPS: {current_fps:.1f} Mode: {mode_txt}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, self.config.fps_text_scale, self.config.fps_text_color, self.config.fps_text_thickness)
+            
             if target_x is not None and self.config.draw_target_z:
-                cv2.putText(
-                    image_np,
-                    f"Target Z: {target_z:.2f}m",
-                    (10, 85),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    self.config.target_z_text_scale,
-                    self.config.target_z_text_color,
-                    self.config.target_z_text_thickness
-                )
-            # ==========================================================
-            # === ЗАПИСЬ (децимация до rec_fps на входе) ===
-            # ==========================================================
+                cv2.putText(image_np, f"Target Z: {target_z:.2f}m", (10, 85), cv2.FONT_HERSHEY_SIMPLEX, self.config.target_z_text_scale, self.config.target_z_text_color, self.config.target_z_text_thickness)
+
             if self.is_recording:
                 if self.config.draw_rec:
-                    cv2.putText(
-                        image_np,
-                        "REC",
-                        (10, 55),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        self.config.rec_text_scale,
-                        self.config.rec_text_color,
-                        self.config.rec_text_thickness
-                    )
+                    cv2.putText(image_np, "REC", (10, 55), cv2.FONT_HERSHEY_SIMPLEX, self.config.rec_text_scale, self.config.rec_text_color, self.config.rec_text_thickness)
                 if not was_recording:
                     rec_file_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
                     was_recording = True
@@ -715,22 +615,12 @@ class VisionLoop:
                     if self.rec_queue.full():
                         self.rec_dropped_frames += 1
                         if self.rec_dropped_frames % 30 == 1:
-                            logger.warning(
-                                f"rec_queue переполнена, пропущено кадров записи: "
-                                f"{self.rec_dropped_frames}"
-                            )
+                            logger.warning(f"rec_queue переполнена, пропущено кадров записи: {self.rec_dropped_frames}")
                     else:
                         try:
-                            self.rec_queue.put_nowait(
-                                (image_np.copy(), rec_file_timestamp)
-                            )
+                            self.rec_queue.put_nowait((image_np.copy(), rec_file_timestamp))
                         except queue.Full:
                             self.rec_dropped_frames += 1
-                            if self.rec_dropped_frames % 30 == 1:
-                                logger.warning(
-                                    f"rec_queue Full при put_nowait, пропущено кадров: "
-                                    f"{self.rec_dropped_frames}"
-                                )
             else:
                 if was_recording:
                     try:
@@ -740,21 +630,19 @@ class VisionLoop:
                             self.rec_queue.get_nowait()
                             self.rec_queue.put_nowait(None)
                         except Exception:
-                            logger.warning(
-                                "rec_queue полна при отправке сигнала остановки записи."
-                            )
+                            logger.warning("rec_queue полна при отправке сигнала остановки записи.")
                     was_recording = False
-            # Отправка на Web
+
             if need_publish and not DISABLE_WEB:
                 try:
                     set_frame(image_np)
                 except Exception as e:
                     logger.error(f"Ошибка Web set_frame: {e}")
+
         self.zed.close()
         self.robot_state['cam_connected'] = False
 
     def _reconnect_camera(self, init_params):
-        """Попытка переподключения камеры"""
         try:
             self.zed.close()
             time.sleep(0.5)
@@ -826,7 +714,6 @@ class VisionLoop:
         self.vision_thread = threading.Thread(target=self._vision_loop, daemon=True)
         self.vision_thread.start()
 
-
 def main():
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.settimeout(config.socket_timeout)
@@ -839,10 +726,13 @@ def main():
             f"Адрес: {config.udp_ip}:{config.udp_port}"
         )
         sys.exit(1)
+
     if not DISABLE_WEB:
         start()
+
     detector = ConeDetector(config)
     car = CarController(config)
+    
     robot_state = {
         'auto_mode': False,
         'cam_connected': False,
@@ -851,7 +741,9 @@ def main():
         'msg_time': 0
     }
     robot_state['arduino_connected'] = car.arduino is not None
+    
     loop = VisionLoop(config, detector, car, robot_state)
+    
     running = True
     last_addr = None
     try:
@@ -860,6 +752,7 @@ def main():
                 data, addr = sock.recvfrom(1024)
                 last_addr = addr
                 command = data.decode('utf-8').strip()
+                
                 if command == "Q":
                     running = False
                     break
@@ -908,34 +801,39 @@ def main():
                         if robot_state['auto_mode'] and (speed != 0.0 or steering != 0.0):
                             robot_state['auto_mode'] = False
                             robot_state['msg_time'] = time.time()
+                        
                         if not robot_state['auto_mode']:
                             car.update(speed, steering)
                     except Exception:
                         pass
-                if time.time() - robot_state['msg_time'] > config.message_clear_timeout:
-                    robot_state['msg'] = ''
-                robot_state['arduino_connected'] = car.arduino is not None
-                telemetry = {
-                    "mode": "AUTO" if robot_state['auto_mode'] else "MANUAL",
-                    "rec": loop.is_recording,
-                    "cam_connected": robot_state['cam_connected'],
-                    "arduino_connected": robot_state['arduino_connected'],
-                    "fwd": car.config.forward_speed,
-                    "bck": car.config.back_speed,
-                    "msg": robot_state['msg']
-                }
-                if last_addr:
-                    sock.sendto(json.dumps(telemetry).encode('utf-8'), last_addr)
+                        
             except socket.timeout:
                 if not robot_state['auto_mode']:
                     car.check_stop()
+            
+            if time.time() - robot_state['msg_time'] > config.message_clear_timeout:
+                robot_state['msg'] = ''
+            
+            robot_state['arduino_connected'] = car.arduino is not None
+            
+            telemetry = {
+                "mode": "AUTO" if robot_state['auto_mode'] else "MANUAL",
+                "rec": loop.is_recording,
+                "cam_connected": robot_state['cam_connected'],
+                "arduino_connected": robot_state['arduino_connected'],
+                "fwd": car.config.forward_speed,
+                "bck": car.config.back_speed,
+                "msg": robot_state['msg']
+            }
+            if last_addr:
+                sock.sendto(json.dumps(telemetry).encode('utf-8'), last_addr)
+                
     except KeyboardInterrupt:
         pass
     finally:
         loop.close()
         car.close()
         sock.close()
-
 
 if __name__ == "__main__":
     main()

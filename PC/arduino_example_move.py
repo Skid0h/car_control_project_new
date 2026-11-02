@@ -9,12 +9,12 @@ Baud = 9600
 
 # Значения в микросекундах
 base_speed = 1500
-forward_speed = 1600
-back_speed = 1400
+forward_speed = 1570
+back_speed = 1430
 
-base_rotation = 130
-right_rotation = 90
-left_rotation = 170
+base_rotation = 87
+right_rotation = 65
+left_rotation = 105
 
 # Настройка логирования
 logging.basicConfig(level=logging.DEBUG, format='%(asctime)s [%(levelname)s] %(message)s')
@@ -33,6 +33,7 @@ def find_arduino_port():
             return port.device
     logger.error("Arduino не найден")
     return None
+        
         
 Arduino_port = find_arduino_port()
 
@@ -62,13 +63,13 @@ class CarController:
             steer_value = right_rotation # Право 
         
         # Отправка команды
-        command = f"{motor_value},{steer_value}\n"
+        command = f"<{motor_value},{steer_value}>"
         self.arduino.write(command.encode())
         logger.debug(f"Команда: {command.strip()}")
     
     def stop(self):
         # Отправляем правильную нейтраль (1500,90)
-        command = f"{base_speed},{base_rotation}\n"
+        command = f"<{base_speed},{base_rotation}>"
         self.arduino.write(command.encode())
         logger.debug("Команда остановки отправлена")
     

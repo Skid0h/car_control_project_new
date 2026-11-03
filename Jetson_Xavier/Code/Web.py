@@ -2,12 +2,14 @@ from flask import Flask, Response, render_template_string
 import cv2
 import numpy as np
 import threading
+import time
 
 app = Flask(__name__)
 
 current_jpeg = None
 frame_lock = threading.Lock()
 frame_event = threading.Event()
+frame_seq = 0  # Счётчик кадров для отслеживания новых кадров
 
 HTML = """
 <!DOCTYPE html>
@@ -28,7 +30,7 @@ HTML = """
 
 def set_frame(frame):
     """Основной код вызывает эту функцию чтобы обновить кадр"""
-    global current_jpeg
+    global current_jpeg, frame_seq
     if frame is None:
         return
     ret, jpeg = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 70])
@@ -37,6 +39,7 @@ def set_frame(frame):
     jpeg_bytes = jpeg.tobytes()
     with frame_lock:
         current_jpeg = jpeg_bytes
+        frame_seq += 1  # Увеличиваем счётчик для отслеживания новых кадров
     frame_event.set()
 
 @app.route('/')
@@ -46,14 +49,24 @@ def index():
 @app.route('/video')
 def video():
     def generate():
+        last_seq = 0
         while True:
+            # Ждём новый кадр с таймаутом для поддержки keep-alive
             frame_event.wait(timeout=1.0)
-            frame_event.clear()
+            
             with frame_lock:
                 jpeg_bytes = current_jpeg
-            if jpeg_bytes is None:
+                seq = frame_seq
+            
+            # Если это тот же кадр - пропускаем
+            if jpeg_bytes is None or seq == last_seq:
                 continue
+            
+            last_seq = seq
             yield (b'--frame\r\nContent-Type: image/jpeg\r\n\r\n' + jpeg_bytes + b'\r\n')
+            
+            # Небольшая задержка чтобы не нагружать сеть
+            time.sleep(0.01)
     return Response(generate(), mimetype='multipart/x-mixed-replace; boundary=frame')
 
 def start():

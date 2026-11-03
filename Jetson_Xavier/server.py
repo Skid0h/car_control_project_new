@@ -201,10 +201,12 @@ class VisionLoop:
                         else:
                             detect_frame = cv2.resize(image_np, (new_w, new_h), interpolation=cv2.INTER_AREA)
 
-                crop_top = int(detect_frame.shape[0] * 0.20)
-                crop_bottom = int(detect_frame.shape[0] * 0.20)
+                # Сохраняем размеры до кропа для корректного пересчёта координат
+                pre_crop_h = detect_frame.shape[0]
+                crop_top = int(pre_crop_h * 0.20)
+                crop_bottom = int(pre_crop_h * 0.20)
                 if crop_top > 0 or crop_bottom > 0:
-                    detect_frame = detect_frame[crop_top:detect_frame.shape[0] - crop_bottom, :]
+                    detect_frame = detect_frame[crop_top:pre_crop_h - crop_bottom, :]
 
                 self.frame_counter += 1
                 should_process = (self.frame_counter % self.process_every) == 0
@@ -217,20 +219,26 @@ class VisionLoop:
 
                 if should_process:
                     detections = self.detector.detect(detect_frame)
+                    # Пересчёт координат обратно к полному кадру image_np
+                    # detect_frame был уменьшен (scale) и обрезан (crop_top)
                     if detect_frame is not image_np:
+                        # Масштаб resize: отношение полного кадра к уменьшенному (без кропа)
                         scale_x = image_np.shape[1] / detect_frame.shape[1]
-                        scale_y = image_np.shape[0] / detect_frame.shape[0]
+                        # scale_y считаем к полной высоте уменьшенного кадра ДО кропа
+                        scale_y = image_np.shape[0] / pre_crop_h
+                        # Смещение crop_top в координатах полного кадра
+                        crop_top_full = int(crop_top * scale_y)
                         for det in detections:
                             x1, y1, x2, y2 = det['bbox']
                             det['bbox'] = (
                                 int(x1 * scale_x),
-                                int(y1 * scale_y),
+                                int(y1 * scale_y) + crop_top_full,
                                 int(x2 * scale_x),
-                                int(y2 * scale_y),
+                                int(y2 * scale_y) + crop_top_full,
                             )
                             center = det.get('center')
                             if center is not None:
-                                det['center'] = (int(center[0] * scale_x), int(center[1] * scale_y))
+                                det['center'] = (int(center[0] * scale_x), int(center[1] * scale_y) + crop_top_full)
 
                     blue_cones = []
                     yellow_cones = []
@@ -385,6 +393,9 @@ class VisionLoop:
                             steer_k = waypoints_3d[0].get('steer_k', 2.0)
                             steering = max(-1.0, min(1.0, error * steer_k))
                             self.car.update(1.0, steering)
+                        else:
+                            # Цель потеряна - останавливаемся для безопасности
+                            self.car.update(0.0, 0.0)  # Нейтральное положение руля, остановка мотора
 
                     self.last_detections = detections
                     self.last_waypoints_3d = waypoints_3d
@@ -473,14 +484,32 @@ class VisionLoop:
         self.zed = None
 
     def restart(self):
+        """Перезапуск системы с проверкой завершения старых потоков"""
         self.close()
+        
+        # Ждём завершения потоков с проверкой is_alive()
+        max_wait = 5.0  # Максимальное время ожидания в секундах
+        start_time = time.time()
+        
+        while (getattr(self, 'vision_thread', None) is not None and self.vision_thread.is_alive()) or \
+              (getattr(self, 'rec_thread', None) is not None and self.rec_thread.is_alive()):
+            if time.time() - start_time > max_wait:
+                logger.warning("Потоки не завершились в течение таймаута, принудительный перезапуск")
+                break
+            time.sleep(0.1)
+        
+        # Дополнительная пауза для стабилизации
         time.sleep(0.5)
+        
+        # Пересоздаём объекты
         self.running = True
         self.is_recording = False
         self.fx = 0
         self.cx_cam = 0
         self.zed = sl.Camera()
         self.rec_queue = queue.Queue(maxsize=30)
+        
+        # Создаём новые потоки только если старые завершились
         self.rec_thread = threading.Thread(target=self._rec_loop, daemon=True)
         self.rec_thread.start()
         self.vision_thread = threading.Thread(target=self._vision_loop, daemon=True)

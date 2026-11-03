@@ -36,6 +36,8 @@ class Config:
         self.command_interval = car['command_interval']
         self.watchdog_timeout = car['watchdog_timeout']
         self.steering_range = car['steering_range']
+        self.esc_min = car['esc_min']
+        self.esc_max = car['esc_max']
         
         # PID
         pid = cfg['pid']

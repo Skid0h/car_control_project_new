@@ -8,7 +8,7 @@ app = Flask(__name__)
 
 current_jpeg = None
 frame_lock = threading.Lock()
-frame_event = threading.Event()
+frame_cond = threading.Condition(frame_lock)  # Condition — издатель и подписчики
 frame_seq = 0  # Счётчик кадров для отслеживания новых кадров
 
 HTML = """
@@ -37,10 +37,10 @@ def set_frame(frame):
     if not ret:
         return
     jpeg_bytes = jpeg.tobytes()
-    with frame_lock:
+    with frame_cond:
         current_jpeg = jpeg_bytes
         frame_seq += 1  # Увеличиваем счётчик для отслеживания новых кадров
-    frame_event.set()
+        frame_cond.notify_all()  # Будим всех ждущих зрителей
 
 @app.route('/')
 def index():
@@ -52,9 +52,9 @@ def video():
         last_seq = 0
         while True:
             # Ждём новый кадр с таймаутом для поддержки keep-alive
-            frame_event.wait(timeout=1.0)
-            
-            with frame_lock:
+            with frame_cond:
+                if frame_seq == last_seq:
+                    frame_cond.wait(timeout=1.0)
                 jpeg_bytes = current_jpeg
                 seq = frame_seq
             

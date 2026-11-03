@@ -65,6 +65,12 @@ class VisionLoop:
         self.rec_thread = threading.Thread(target=self._rec_loop, daemon=True)
         self.rec_thread.start()
 
+        # Состояние ПИД-регулятора ищусительного сглаживания
+        self.pid_integral = 0.0
+        self.pid_prev_error = 0.0
+        self.pid_prev_time = None
+        self.pid_smoothed_error = 0.0
+
         self.vision_thread = threading.Thread(target=self._vision_loop, daemon=True)
         self.vision_thread.start()
 
@@ -118,11 +124,69 @@ class VisionLoop:
         except Exception as e:
             logger.error(f"Ошибка конвертации: {e}")
 
+    def _pid_steering(self, error, steer_limit):
+        """ПИД-регулятор руля с EMA-сглаживанием ошибки и анти-windup.
+
+        В отличие от простого P (steering = error * k), здесь:
+          * I-часть убирает систематическое смещение (машину тянет к краю из-за кривого руля);
+          * D-часть демпфирует резкие движения руля;
+          * EMA-фильтр сглаживает шум от детекции конусов;
+          * error_decay_rate плавно возвращает руль в центр при потере цели.
+        Все коэффициенты берутся из блока 'pid' в config.jsonc.
+        """
+        cfg = self.config
+        now = time.time()
+
+        # EMA-сглаживание ошибки
+        self.pid_smoothed_error = cfg.ema_alpha * error + (1.0 - cfg.ema_alpha) * self.pid_smoothed_error
+        err = self.pid_smoothed_error
+
+        # Производная: d(err)/dt
+        if self.pid_prev_time is not None:
+            dt = max(now - self.pid_prev_time, cfg.min_dt)
+            derivative = (err - self.pid_prev_error) / dt
+        else:
+            derivative = 0.0
+        self.pid_prev_time = now
+        self.pid_prev_error = err
+
+        # Интеграл с анти-windup (клиппинг по max_integral)
+        self.pid_integral += cfg.ki_gain * err * dt if self.pid_prev_time else 0.0
+        self.pid_integral = max(-cfg.max_integral, min(cfg.max_integral, self.pid_integral))
+
+        # Выход ПИД
+        output = cfg.kp_gain * err + self.pid_integral + cfg.kd_gain * derivative
+
+        # Ограничение максимального хода руля и приведение к [-1, 1]
+        steer_limit = max(0.0, min(1.0, steer_limit))
+        output = cfg.max_steering_output * output
+        output = max(-steer_limit, min(steer_limit, output))
+        return output
+
+    def _select_lookahead_target(self, waypoints_3d, lookahead):
+        """Pure Pursuit: выбор точки траектории на дистанции упреждения.
+
+        Берём самую дальнюю точку, которая ещё не дальше lookahead_distance.
+        Это устраняет дёрганье при близкой цели и запаздывание при дальней.
+        Список сортирован по z (возрастание), поэтому идём от ближайшей к дальней.
+        """
+        if not waypoints_3d:
+            return None
+        target = waypoints_3d[0]
+        for wp in waypoints_3d:
+            if wp['z'] <= lookahead:
+                target = wp
+            else:
+                break
+        return target
+
     def _vision_loop(self):
         init_params = sl.InitParameters()
         init_params.camera_resolution = getattr(sl.RESOLUTION, self.config.zed_resolution, sl.RESOLUTION.HD720)
         init_params.camera_fps = self.config.zed_fps
         init_params.coordinate_units = getattr(sl.UNIT, self.config.coordinate_units, sl.UNIT.METER)
+        # Пункт 8: применяем режим глубины из конфига (PERFORMANCE / QUALITY / ULTRA)
+        init_params.depth_mode = getattr(sl.DEPTH_MODE, self.config.depth_mode, sl.DEPTH_MODE.PERFORMANCE)
        
         if self.zed.open(init_params) != sl.ERROR_CODE.SUCCESS:
             logger.error("Не удалось открыть ZED-камеру.")
@@ -139,7 +203,9 @@ class VisionLoop:
         image_zed = sl.Mat()
 
         fps_counter = 0
+        process_fps_counter = 0  # Пункт 11: считаем кадры, где реально прошла детекция
         current_fps = 0
+        current_process_fps = 0
         fps_last_time = time.time()
         rec_timestamp = None
         was_recording = False
@@ -218,6 +284,7 @@ class VisionLoop:
                 target_detected = self.last_target_detected
 
                 if should_process:
+                    process_fps_counter += 1  # Пункт 11: детекция действительно прошла
                     detections = self.detector.detect(detect_frame)
                     # Пересчёт координат обратно к полному кадру image_np
                     # detect_frame был уменьшен (scale) и обрезан (crop_top)
@@ -410,22 +477,19 @@ class VisionLoop:
                     self.last_target_z = target_z
                     self.last_target_detected = target_detected
 
-                else:
-                    detections = self.last_detections
-                    waypoints_3d = self.last_waypoints_3d
-                    target_x = self.last_target_x
-                    target_z = self.last_target_z
-                    target_detected = self.last_target_detected
+                # Пункт 9: else-ветка удалена — в начале блока уже присвоены last_* значения
 
-                # FPS 
+                # FPS — отдельно считаем захват и обработку (пункт 11)
                 fps_counter += 1
                 if time.time() - fps_last_time >= self.config.fps_update_interval:
                     current_fps = fps_counter
+                    current_process_fps = process_fps_counter
                     fps_counter = 0
+                    process_fps_counter = 0
                     fps_last_time = time.time()
                 
                 if self.config.draw_fps:
-                    cv2.putText(image_np, f"FPS: {current_fps} Mode: {'AUTO' if self.robot_state.get('auto_mode') else 'MANUAL'}", 
+                    cv2.putText(image_np, f"FPS: {current_fps} ({current_process_fps} det) Mode: {'AUTO' if self.robot_state.get('auto_mode') else 'MANUAL'}", 
                                (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 
                                self.config.fps_text_scale, self.config.fps_text_color, self.config.fps_text_thickness)
                 if target_x is not None and self.config.draw_target_z:

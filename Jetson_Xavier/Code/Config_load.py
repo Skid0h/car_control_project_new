@@ -62,6 +62,8 @@ class Config:
         self.virtual_steer_k = ap['virtual_steer_k']
         self.stop_cone_z_threshold = ap['stop_cone_z_threshold']
         self.area_depth_constant = ap['area_depth_constant']
+        self.graceful_degradation_speed = ap['graceful_degradation_speed']
+        self.min_free_space_mb = ap['min_free_space_mb']
         
         # Vision
         vis = cfg['vision']

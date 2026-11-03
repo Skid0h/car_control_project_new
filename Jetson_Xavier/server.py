@@ -11,7 +11,6 @@ import sys
 import json
 import math
 import subprocess
-import shutil
 from datetime import datetime
 import cv2
 import pyzed.sl as sl
@@ -109,6 +108,14 @@ class VisionLoop:
                 rec_start_time = time.time()
             video_writer.write(frame)
             rec_frame_count += 1
+
+            # Проверка записи: если кадр не удалось записать (например, диск заполнен),
+            # отправляем предупреждение в телеметрию и обрываем запись
+            if not video_writer.isOpened():
+                self.robot_state['msg'] = "НЕДОСТАТОЧНО МЕСТА: запись прервана"
+                self.robot_state['msg_time'] = time.time()
+                logger.warning("Запись прервана: не удалось записать кадр (заполнен диск)")
+                break
 
         if video_writer is not None:
             video_writer.release()
@@ -214,9 +221,7 @@ class VisionLoop:
         image_zed = sl.Mat()
 
         fps_counter = 0
-        process_fps_counter = 0  # Пункт 11: считаем кадры, где реально прошла детекция
         current_fps = 0
-        current_process_fps = 0
         fps_last_time = time.time()
         rec_timestamp = None
         was_recording = False
@@ -295,7 +300,6 @@ class VisionLoop:
                 target_detected = self.last_target_detected
 
                 if should_process:
-                    process_fps_counter += 1  # Пункт 11: детекция действительно прошла
                     detections = self.detector.detect(detect_frame)
                     # Пересчёт координат обратно к полному кадру image_np
                     # detect_frame был уменьшен (scale) и обрезан (crop_top)
@@ -501,17 +505,15 @@ class VisionLoop:
 
                 # Пункт 9: else-ветка удалена — в начале блока уже присвоены last_* значения
 
-                # FPS — отдельно считаем захват и обработку (пункт 11)
+                # FPS
                 fps_counter += 1
                 if time.time() - fps_last_time >= self.config.fps_update_interval:
                     current_fps = fps_counter
-                    current_process_fps = process_fps_counter
                     fps_counter = 0
-                    process_fps_counter = 0
                     fps_last_time = time.time()
                 
                 if self.config.draw_fps:
-                    cv2.putText(image_np, f"FPS: {current_fps} ({current_process_fps} det) Mode: {'AUTO' if self.robot_state.get('auto_mode') else 'MANUAL'}", 
+                    cv2.putText(image_np, f"FPS: {current_fps} Mode: {'AUTO' if self.robot_state.get('auto_mode') else 'MANUAL'}", 
                                (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 
                                self.config.fps_text_scale, self.config.fps_text_color, self.config.fps_text_thickness)
                 if target_x is not None and self.config.draw_target_z:
@@ -524,16 +526,8 @@ class VisionLoop:
                         cv2.putText(image_np, "REC", (10, 55), cv2.FONT_HERSHEY_SIMPLEX,
                                    self.config.rec_text_scale, self.config.rec_text_color, self.config.rec_text_thickness)
                     if not was_recording:
-                        # Проверка свободного места перед началом записи
-                        free_space_mb = shutil.disk_usage(self.config.output_folder).free // (1024 * 1024)
-                        if free_space_mb < self.config.min_free_space_mb:
-                            self.robot_state['msg'] = f"НЕДОСТАТОЧНО МЕСТА: {free_space_mb}MB"
-                            self.robot_state['msg_time'] = time.time()
-                            self.is_recording = False
-                            logger.warning(f"Запись отменена: мало места ({free_space_mb}MB < {self.config.min_free_space_mb}MB)")
-                        else:
-                            rec_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                            was_recording = True
+                        rec_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                        was_recording = True
                     if self.is_recording and not self.rec_queue.full():
                         self.rec_queue.put((image_np.copy(), rec_timestamp))
                 else:

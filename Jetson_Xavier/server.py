@@ -255,7 +255,8 @@ class VisionLoop:
                         if self.config.min_depth < z <= self.config.max_depth:
                             u, v = det['center']
                             x_cam = (u - self.cx_cam) * z / self.fx
-                            det['pos_3d'] = (x_cam, z - self.config.camera_offset_z)
+                            # Учитываем смещение камеры относительно центра машины по X
+                            det['pos_3d'] = (x_cam - self.config.camera_offset_x, z - self.config.camera_offset_z)
                             
                             if self.config.draw_target_z:
                                 cv2.putText(image_np, f"Z:{z:.1f}m", (x1, y1-25), 
@@ -272,10 +273,12 @@ class VisionLoop:
                             elif cone_name in self.config.orange_cones:
                                 orange_cones.append(det)
 
-                    waypoints_3d = [] 
+                    waypoints_3d = []
                     
-                    blue_cones.sort(key=lambda c: c['pos_3d'][1])
-                    yellow_cones.sort(key=lambda c: c['pos_3d'][1])
+                    # Сортируем только конусы с вычисленной 3D-позицией (защита от KeyError)
+                    blue_cones = sorted((c for c in blue_cones if 'pos_3d' in c), key=lambda c: c['pos_3d'][1])
+                    yellow_cones = sorted((c for c in yellow_cones if 'pos_3d' in c), key=lambda c: c['pos_3d'][1])
+                    orange_cones = [c for c in orange_cones if 'pos_3d' in c]
                     
                     used_yellows = set()
                     pairs_found_count = 0
@@ -330,6 +333,9 @@ class VisionLoop:
                     if self.config.draw_trajectory and should_process:
                         pts_2d = [[image_np.shape[1]//2, image_np.shape[0]]]
                         for wp in waypoints_3d:
+                            # Защита от деления на ноль: точки с z <= 0 не проецируем
+                            if wp['z'] <= 0:
+                                continue
                             u = int((wp['x'] * self.fx / wp['z']) + self.cx_cam)
                             v = int(image_np.shape[0] * self.config.cone_base_v)
                             pts_2d.append([u, v])
@@ -344,7 +350,8 @@ class VisionLoop:
                         target_x = waypoints_3d[0]['x']
                         target_z = waypoints_3d[0]['z']
                         
-                        if self.config.draw_target:
+                        # Отрисовка цели только если z корректен для проекции
+                        if self.config.draw_target and target_z > 0:
                             target_u = int((target_x * self.fx / target_z) + self.cx_cam)
                             target_v = int(image_np.shape[0] * self.config.cone_base_v)
                             cv2.drawMarker(image_np, (target_u, target_v), (0, 0, 255), 
@@ -388,7 +395,7 @@ class VisionLoop:
                             def _brake(car=self.car):
                                 car.stop()
                             threading.Thread(target=_brake, daemon=True).start()
-                        elif target_x is not None:
+                        elif target_x is not None and target_z is not None and target_z > 0:
                             error = math.atan2(target_x, target_z)
                             steer_k = waypoints_3d[0].get('steer_k', 2.0)
                             steering = max(-1.0, min(1.0, error * steer_k))
@@ -585,10 +592,16 @@ def main():
                     logger.info("Система успешно перезагружена!")
                 elif command.startswith("speed:"):
                     try:
-                        fwd, bck = map(int, command[6:].split(','))
+                        parts = command[len("speed:"):].split(',')
+                        if len(parts) != 2:
+                            raise ValueError(f"ожидалось 2 значения, получено {len(parts)}")
+                        fwd, bck = (int(p.strip()) for p in parts)
+                        # Контроль диапазона ШИМ (защита от опечаток клиента)
+                        if not (config.esc_min <= fwd <= config.esc_max and config.esc_min <= bck <= config.esc_max):
+                            raise ValueError(f"ШИМ вне диапазона [{config.esc_min}, {config.esc_max}]")
                         car.set_speeds(fwd, bck)
-                    except:
-                        pass
+                    except (ValueError, TypeError) as e:
+                        logger.warning(f"Некорректная команда speed: {command!r} ({e})")
                 else:
                     try:
                         speed, steering = map(float, command.split(','))
@@ -602,10 +615,10 @@ def main():
 
                 if time.time() - robot_state['msg_time'] > config.message_clear_timeout:
                     robot_state['msg'] = ''
-                
+
                 # Обновляем статус подключения Arduino
                 robot_state['arduino_connected'] = car.arduino is not None
-                
+
                 telemetry = {
                     "mode": "AUTO" if robot_state['auto_mode'] else "MANUAL",
                     "rec": loop.is_recording,

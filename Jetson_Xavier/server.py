@@ -11,6 +11,7 @@ import sys
 import json
 import math
 import subprocess
+import shutil
 from datetime import datetime
 import cv2
 import pyzed.sl as sl
@@ -65,11 +66,12 @@ class VisionLoop:
         self.rec_thread = threading.Thread(target=self._rec_loop, daemon=True)
         self.rec_thread.start()
 
-        # Состояние ПИД-регулятора ищусительного сглаживания
+        # Состояние ПИД-регулятора и сглаживания ошибки
         self.pid_integral = 0.0
         self.pid_prev_error = 0.0
         self.pid_prev_time = None
         self.pid_smoothed_error = 0.0
+        self.last_steering = 0.0  # Для graceful degradation
 
         self.vision_thread = threading.Thread(target=self._vision_loop, daemon=True)
         self.vision_thread.start()
@@ -172,9 +174,18 @@ class VisionLoop:
         """
         if not waypoints_3d:
             return None
+        
+        # Адаптируем дистанцию упреждения под скорость (если pure_pursuit_alpha > 0)
+        if hasattr(self.config, 'pure_pursuit_alpha') and self.config.pure_pursuit_alpha > 0:
+            # Предполагаем, что скорость пропорциональна forward_speed (условно)
+            speed_factor = self.config.forward_speed / 1570.0  # Нормализация к базовой скорости
+            adjusted_lookahead = lookahead * (1.0 + self.config.pure_pursuit_alpha * (speed_factor - 1.0))
+        else:
+            adjusted_lookahead = lookahead
+        
         target = waypoints_3d[0]
         for wp in waypoints_3d:
-            if wp['z'] <= lookahead:
+            if wp['z'] <= adjusted_lookahead:
                 target = wp
             else:
                 break
@@ -413,9 +424,13 @@ class VisionLoop:
                                          thickness=self.config.trajectory_thickness)
 
                     target_x, target_z = None, None
+                    target_wp = None
                     if len(waypoints_3d) > 0:
-                        target_x = waypoints_3d[0]['x']
-                        target_z = waypoints_3d[0]['z']
+                        # Pure Pursuit: выбираем точку на дистанции упреждения
+                        target_wp = self._select_lookahead_target(waypoints_3d, self.config.lookahead_distance)
+                        if target_wp:
+                            target_x = target_wp['x']
+                            target_z = target_wp['z']
                         
                         # Отрисовка цели только если z корректен для проекции
                         if self.config.draw_target and target_z > 0:
@@ -464,12 +479,19 @@ class VisionLoop:
                             threading.Thread(target=_brake, daemon=True).start()
                         elif target_x is not None and target_z is not None and target_z > 0:
                             error = math.atan2(target_x, target_z)
-                            steer_k = waypoints_3d[0].get('steer_k', 2.0)
-                            steering = max(-1.0, min(1.0, error * steer_k))
+                            # Используем steer_k из выбранной точки (если есть), иначе дефолтный
+                            steer_k = target_wp.get('steer_k', 2.0) if target_wp else 2.0
+                            # Используем PID-регулятор вместо простого error * steer_k
+                            steering = self._pid_steering(error, steer_k)
+                            self.last_steering = steering
                             self.car.update(1.0, steering)
                         else:
-                            # Цель потеряна - останавливаемся для безопасности
-                            self.car.update(0.0, 0.0)  # Нейтральное положение руля, остановка мотора
+                            # Graceful degradation: плавное возвращение руля в центр
+                            self.last_steering *= self.config.error_decay_rate
+                            if abs(self.last_steering) > 0.01:
+                                self.car.update(self.config.graceful_degradation_speed, self.last_steering)
+                            else:
+                                self.car.update(0.0, 0.0)
 
                     self.last_detections = detections
                     self.last_waypoints_3d = waypoints_3d
@@ -502,9 +524,17 @@ class VisionLoop:
                         cv2.putText(image_np, "REC", (10, 55), cv2.FONT_HERSHEY_SIMPLEX,
                                    self.config.rec_text_scale, self.config.rec_text_color, self.config.rec_text_thickness)
                     if not was_recording:
-                        rec_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                        was_recording = True
-                    if not self.rec_queue.full():
+                        # Проверка свободного места перед началом записи
+                        free_space_mb = shutil.disk_usage(self.config.output_folder).free // (1024 * 1024)
+                        if free_space_mb < self.config.min_free_space_mb:
+                            self.robot_state['msg'] = f"НЕДОСТАТОЧНО МЕСТА: {free_space_mb}MB"
+                            self.robot_state['msg_time'] = time.time()
+                            self.is_recording = False
+                            logger.warning(f"Запись отменена: мало места ({free_space_mb}MB < {self.config.min_free_space_mb}MB)")
+                        else:
+                            rec_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                            was_recording = True
+                    if self.is_recording and not self.rec_queue.full():
                         self.rec_queue.put((image_np.copy(), rec_timestamp))
                 else:
                     if was_recording:

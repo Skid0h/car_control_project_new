@@ -59,5 +59,5 @@ class ConeDetector:
                    })
            return detections
        except Exception as e:
-           logger.debug(f"Ошибка детекции: {e}")
+           logger.warning(f"Ошибка детекции: {e}")
            return []

@@ -47,12 +47,18 @@ class CarController:
         if not self.arduino: return
         speed_clamped = max(-1.0, min(1.0, float(speed)))
         motor_value = self.config.neutral_speed
-        if speed_clamped > 0: motor_value = int(self.config.neutral_speed + (self.config.forward_speed - self.config.neutral_speed) * speed_clamped)
-        elif speed_clamped < 0: motor_value = int(self.config.neutral_speed + (self.config.back_speed - self.config.neutral_speed) * abs(speed_clamped))
+        if speed_clamped > 0: 
+            motor_value = int(self.config.neutral_speed + (self.config.forward_speed - self.config.neutral_speed) * speed_clamped)
+        elif speed_clamped < 0: 
+            motor_value = int(self.config.neutral_speed + (self.config.back_speed - self.config.neutral_speed) * abs(speed_clamped))
+        # Ограничиваем motor_value в безопасные пределы ESC (1000-2000 мкс)
+        motor_value = max(self.config.esc_min, min(self.config.esc_max, motor_value))
        
         steering_clamped = max(-1.0, min(1.0, float(steering)))
         steer_value = int(self.config.center_steering - (steering_clamped * self.config.steering_range))
-        steer_value = max(0, min(180, steer_value))
+        # Ограничиваем steer_value в рабочий диапазон сервопривода
+        steer_value = max(self.config.center_steering - self.config.steering_range, 
+                          min(self.config.center_steering + self.config.steering_range, steer_value))
        
         command = f"<{motor_value},{steer_value}>"
         current_time = time.time()

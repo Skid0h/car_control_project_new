@@ -69,12 +69,14 @@ class Config:
         self.yolo_model_path = vis['yolo_model_path']
         self.confidence_threshold = vis['confidence_threshold']
         self.iou_threshold = vis['iou_threshold']
-        self.target_fps = vis['target_fps']
+        # ЕДИНЫЙ параметр fps: управляет камерой ZED, обработкой и веб-стримом
+        self.fps = int(vis.get('fps', 30))
+        self.target_fps = float(self.fps)   # внутренний алиас
         self.output_folder = vis['output_folder']
         self.camera_offset_x = vis['camera_offset_x']
         self.camera_offset_z = vis['camera_offset_z']
         self.zed_resolution = vis['zed_resolution']
-        self.zed_fps = vis['zed_fps']
+        self.zed_fps = self.fps             # внутренний алиас
         self.depth_mode = vis['depth_mode']
         self.coordinate_units = vis['coordinate_units']
         self.cone_base_v = vis['cone_base_v']

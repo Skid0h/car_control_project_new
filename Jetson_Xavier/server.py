@@ -47,12 +47,12 @@ class VisionLoop:
         self.running = True
         self.is_recording = False
         self.frame_counter = 0
-        # FPS: камера не выше 30, обработка и публикация каждого кадра.
+        # ЕДИНЫЙ параметр fps (config.fps): камера, обработка и веб-стрим (макс. 30).
         # Детекция YOLO вынесена в отдельный поток (detect_thread),
         # поэтому инференс (~125 мс) больше не блокирует цикл камеры.
-        self.target_fps = min(float(self.config.target_fps), 30.0)
-        self.process_every = max(1, int(round(min(int(self.config.zed_fps), 30) / max(1.0, self.target_fps))))
-        self.publish_every = max(1, self.process_every)
+        self.target_fps = min(float(self.config.fps), 30.0)
+        self.process_every = 1
+        self.publish_every = 1
         self.last_detections = []
         self.last_waypoints_3d = []
         self.last_target_x = None
@@ -153,7 +153,7 @@ class VisionLoop:
                     video_writer.release()
                     video_writer = None
                     rec_duration = time.time() - rec_start_time
-                    real_fps = rec_frame_count / rec_duration if rec_duration > 0 else self.config.zed_fps
+                    real_fps = rec_frame_count / rec_duration if rec_duration > 0 else float(self.config.fps)
                     threading.Thread(target=self._convert_video, args=(temp_video_path, final_video_path, real_fps)).start()
                 continue
 
@@ -163,7 +163,7 @@ class VisionLoop:
                 final_video_path = os.path.join(self.config.output_folder, f"{self.config.output_prefix}_{timestamp}.{self.config.output_extension}")
                 h, w = frame.shape[:2]
                 fourcc = cv2.VideoWriter_fourcc(*self.config.temp_codec)
-                video_writer = cv2.VideoWriter(temp_video_path, fourcc, self.config.zed_fps, (w, h))
+                video_writer = cv2.VideoWriter(temp_video_path, fourcc, float(self.config.fps), (w, h))
                 rec_frame_count = 0
                 rec_start_time = time.time()
             video_writer.write(frame)
@@ -261,7 +261,7 @@ class VisionLoop:
     def _vision_loop(self):
         init_params = sl.InitParameters()
         init_params.camera_resolution = getattr(sl.RESOLUTION, self.config.zed_resolution, sl.RESOLUTION.HD720)
-        init_params.camera_fps = min(int(self.config.zed_fps), 30)  # выше 30 FPS камеру не запрашиваем
+        init_params.camera_fps = min(int(self.config.fps), 30)  # камера не выше 30 FPS
         init_params.coordinate_units = getattr(sl.UNIT, self.config.coordinate_units, sl.UNIT.METER)
         # Пункт 8: применяем режим глубины из конфига (PERFORMANCE / QUALITY / ULTRA)
         init_params.depth_mode = getattr(sl.DEPTH_MODE, self.config.depth_mode, sl.DEPTH_MODE.PERFORMANCE)

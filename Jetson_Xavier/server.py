@@ -520,6 +520,11 @@ class VisionLoop:
                     cv2.putText(image_np, f"Target Z: {target_z:.2f}m", (10, 85), cv2.FONT_HERSHEY_SIMPLEX, 
                                self.config.target_z_text_scale, self.config.target_z_text_color, self.config.target_z_text_thickness)
                 
+                # Скорость с датчика Arduino (чуть ниже FPS/Target Z)
+                if self.config.draw_speed and self.car is not None:
+                    cv2.putText(image_np, f"Speed: {self.car.get_speed():.2f} m/s", (10, 115), cv2.FONT_HERSHEY_SIMPLEX,
+                               self.config.speed_text_scale, self.config.speed_text_color, self.config.speed_text_thickness)
+                
                 # ЗАПИСЬ
                 if self.is_recording:
                     if self.config.draw_rec:

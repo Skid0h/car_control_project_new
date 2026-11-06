@@ -27,6 +27,8 @@ class CarController:
         self.last_command_time = 0                                      # Для watchdog
         self.last_sent_cmd     = ""                                     # Последняя отправленная строка команды
         self.arduino = None
+        self.current_speed   = 0.0                                      # Текущая скорость с датчика (м/с)
+        self._reader_thread  = None                                     # Поток чтения скорости из UART
 
         port = find_arduino_port()
         if port is None: return
@@ -36,8 +38,42 @@ class CarController:
             time.sleep(self.config.arduino_init_delay)
             self.stop()
             time.sleep(self.config.arduino_post_stop_delay)
+            self._start_reader()
         except Exception as e:
             self.arduino = None
+
+    def _start_reader(self):
+        """Запуск потока чтения строк вида S:<скорость> от Arduino"""
+        self._reader_thread = threading.Thread(target=self._read_loop, daemon=True)
+        self._reader_thread.start()
+
+    def _read_loop(self):
+        while True:
+            ser = self.arduino
+            if ser is None:
+                return
+            try:
+                line = ser.readline().decode('utf-8', errors='ignore').strip()
+            except Exception:
+                self.arduino = None
+                return
+            if not line:
+                continue
+            # Формат от Arduino: "S:12.34" (или debug-строка "Speed: 12.34")
+            if line.startswith('S:'):
+                try:
+                    self.current_speed = float(line[2:])
+                except ValueError:
+                    pass
+            elif line.startswith('Speed:'):
+                try:
+                    self.current_speed = float(line.split(':', 1)[1])
+                except (ValueError, IndexError):
+                    pass
+
+    def get_speed(self):
+        """Текущая скорость машины по датчику, м/с"""
+        return self.current_speed
    
     def set_speeds(self, forward, back):
         self.config.forward_speed = forward
@@ -95,6 +131,7 @@ class CarController:
         self.stop()
         time.sleep(self.config.arduino_close_delay)
         if self.arduino: self.arduino.close()
+        self.arduino = None
     
     def restart(self):
         """Перезагрузка подключения Arduino"""
@@ -109,5 +146,6 @@ class CarController:
             time.sleep(self.config.arduino_init_delay)
             self.stop()
             time.sleep(self.config.arduino_post_stop_delay)
+            self._start_reader()
         except Exception as e:
             self.arduino = None

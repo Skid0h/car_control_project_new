@@ -151,6 +151,10 @@ void updateSpeedSensor() {
         double revPerSec = 1000.0 / deltaTime;
         double speed = revPerSec * WHEEL_LENGTH;
 
+        // Отправляем значение скорости в формате S:xx.xx для Jetson
+        Serial.print("S:");
+        Serial.println(speed);
+
         if (SPEED_DEBUG) {
           Serial.print("Speed: ");
           Serial.println(speed);

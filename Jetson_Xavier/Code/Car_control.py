@@ -44,18 +44,23 @@ class CarController:
 
     def _start_reader(self):
         """Запуск потока чтения строк вида S:<скорость> от Arduino"""
-        self._reader_thread = threading.Thread(target=self._read_loop, daemon=True)
+        self._reader_generation = getattr(self, '_reader_generation', 0) + 1
+        gen = self._reader_generation
+        self._reader_thread = threading.Thread(target=self._read_loop, args=(gen,), daemon=True)
         self._reader_thread.start()
 
-    def _read_loop(self):
+    def _read_loop(self, generation):
         while True:
             ser = self.arduino
-            if ser is None:
-                return
+            if ser is None or generation != getattr(self, '_reader_generation', 0):
+                return  # соединение закрыто или запущен новый поток чтения
             try:
                 line = ser.readline().decode('utf-8', errors='ignore').strip()
             except Exception:
-                self.arduino = None
+                # Не трогаем self.arduino здесь: при переподключении restart()
+                # уже создал новый объект, и старый поток не должен его обнулять
+                if self.arduino is ser:
+                    self.arduino = None
                 return
             if not line:
                 continue

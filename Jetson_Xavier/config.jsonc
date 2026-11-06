@@ -90,12 +90,12 @@
     "yolo_model_path"            : "/mnt/ArdorSSD/car_control_project_new/Datasets/cone_detector_v3.engine",
     "confidence_threshold"       : 0.5,                     // Порог уверенности детекции
     "iou_threshold"              : 0.5,                     // Порог IoU для NMS (подавление пересекающихся рамок)
-    "target_fps"                 : 15.0,
+    "target_fps"                 : 30.0,
     "output_folder"              : "zed_recordings",        // Папка для сохранения видеозаписей
     "camera_offset_x"            : -0.06,                   // Смещение камеры по оси X относительно центра машины (метры)
     "camera_offset_z"            : 0.10,                    // Расстояние от камеры до передней оси машины (метры). Конус реально ближе на это значение
     "zed_resolution"             : "HD720",
-    "zed_fps"                    : 15,
+    "zed_fps"                    : 30,
     "depth_mode"                 : "PERFORMANCE",           // Режим глубины ZED: PERFORMANCE, QUALITY, ULTRA
     "coordinate_units"           : "METER",
     "cone_base_v"                : 0.65,                    // Вертикальная координата для отрисовки точек траектории (доля от высоты кадра, 0.65 = 65% сверху)

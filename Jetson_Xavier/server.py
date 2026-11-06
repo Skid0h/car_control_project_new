@@ -47,7 +47,11 @@ class VisionLoop:
         self.running = True
         self.is_recording = False
         self.frame_counter = 0
-        self.process_every = max(1, int(round(self.config.zed_fps / max(1.0, self.config.target_fps))))
+        # FPS: камера не выше 30, обработка и публикация каждого кадра.
+        # Детекция YOLO вынесена в отдельный поток (detect_thread),
+        # поэтому инференс (~125 мс) больше не блокирует цикл камеры.
+        self.target_fps = min(float(self.config.target_fps), 30.0)
+        self.process_every = max(1, int(round(min(int(self.config.zed_fps), 30) / max(1.0, self.target_fps))))
         self.publish_every = max(1, self.process_every)
         self.last_detections = []
         self.last_waypoints_3d = []
@@ -65,6 +69,12 @@ class VisionLoop:
         self.rec_thread = threading.Thread(target=self._rec_loop, daemon=True)
         self.rec_thread.start()
 
+        # Детекция YOLO в отдельном потоке: инференс не блокирует захват/публикацию кадров
+        self.detect_queue = queue.Queue(maxsize=1)
+        self.result_queue = queue.Queue(maxsize=1)
+        self.detect_thread = threading.Thread(target=self._detect_loop, daemon=True)
+        self.detect_thread.start()
+
         # Состояние ПИД-регулятора и сглаживания ошибки
         self.pid_integral = 0.0
         self.pid_prev_error = 0.0
@@ -74,6 +84,56 @@ class VisionLoop:
 
         self.vision_thread = threading.Thread(target=self._vision_loop, daemon=True)
         self.vision_thread.start()
+
+    def _detect_loop(self):
+        """Детекция YOLO в отдельном потоке.
+
+        Основной цикл кладёт кадр в detect_queue и НЕ ждёт результата:
+        инференс больше не ограничивает FPS захвата и веб-стрима.
+        В result_queue всегда лежит только самый свежий результат.
+        """
+        while self.running:
+            try:
+                task = self.detect_queue.get(timeout=0.5)
+            except queue.Empty:
+                continue
+            if task is None:
+                break
+
+            frame_id, detect_frame, full_size, pre_crop_h, crop_top = task
+            try:
+                detections = self.detector.detect(detect_frame)
+            except Exception as e:
+                logger.warning(f"Ошибка детекции: {e}")
+                detections = []
+
+            # Пересчёт координат обратно к полному кадру image_np
+            # detect_frame был уменьшен (resize) и обрезан (crop_top)
+            if detect_frame.shape[1] != full_size[0] or detect_frame.shape[0] != full_size[1]:
+                scale_x = full_size[0] / detect_frame.shape[1]
+                scale_y = full_size[1] / pre_crop_h
+                crop_top_full = int(crop_top * scale_y)
+                for det in detections:
+                    x1, y1, x2, y2 = det['bbox']
+                    det['bbox'] = (
+                        int(x1 * scale_x),
+                        int(y1 * scale_y) + crop_top_full,
+                        int(x2 * scale_x),
+                        int(y2 * scale_y) + crop_top_full,
+                    )
+                    center = det.get('center')
+                    if center is not None:
+                        det['center'] = (int(center[0] * scale_x), int(center[1] * scale_y) + crop_top_full)
+
+            # В очереди результатов — только последний результат, старые выбрасываем
+            try:
+                self.result_queue.get_nowait()
+            except queue.Empty:
+                pass
+            try:
+                self.result_queue.put_nowait((frame_id, detections))
+            except queue.Full:
+                pass
 
     def _rec_loop(self):
         video_writer = None
@@ -201,7 +261,7 @@ class VisionLoop:
     def _vision_loop(self):
         init_params = sl.InitParameters()
         init_params.camera_resolution = getattr(sl.RESOLUTION, self.config.zed_resolution, sl.RESOLUTION.HD720)
-        init_params.camera_fps = self.config.zed_fps
+        init_params.camera_fps = min(int(self.config.zed_fps), 30)  # выше 30 FPS камеру не запрашиваем
         init_params.coordinate_units = getattr(sl.UNIT, self.config.coordinate_units, sl.UNIT.METER)
         # Пункт 8: применяем режим глубины из конфига (PERFORMANCE / QUALITY / ULTRA)
         init_params.depth_mode = getattr(sl.DEPTH_MODE, self.config.depth_mode, sl.DEPTH_MODE.PERFORMANCE)
@@ -230,6 +290,7 @@ class VisionLoop:
         max_grab_errors = 5
 
         logger.info(f"Обычный автопилот: Оценка глубины по площади + Блокировка виртуальных точек.")
+        logger.info(f"FPS: камера={init_params.camera_fps}, target={self.target_fps}, process_every={self.process_every}, publish_every={self.publish_every}, детекция в отдельном потоке")
 
         while self.running:
             try:
@@ -293,35 +354,39 @@ class VisionLoop:
                 self.frame_counter += 1
                 should_process = (self.frame_counter % self.process_every) == 0
 
+                # Кадр уходит в отдельный поток детекции: инференс YOLO
+                # не блокирует захват кадров и публикацию в веб (это и был затык на 8 FPS)
+                if should_process:
+                    task = (self.frame_counter,
+                            detect_frame.copy(),
+                            (image_np.shape[1], image_np.shape[0]),
+                            pre_crop_h,
+                            crop_top)
+                    try:
+                        self.detect_queue.get_nowait()  # сбрасываем кадр, который детектор не успел взять
+                    except queue.Empty:
+                        pass
+                    try:
+                        self.detect_queue.put_nowait(task)
+                    except queue.Full:
+                        pass
+
                 detections = self.last_detections
                 waypoints_3d = self.last_waypoints_3d
                 target_x = self.last_target_x
                 target_z = self.last_target_z
                 target_detected = self.last_target_detected
 
-                if should_process:
-                    detections = self.detector.detect(detect_frame)
-                    # Пересчёт координат обратно к полному кадру image_np
-                    # detect_frame был уменьшен (scale) и обрезан (crop_top)
-                    if detect_frame is not image_np:
-                        # Масштаб resize: отношение полного кадра к уменьшенному (без кропа)
-                        scale_x = image_np.shape[1] / detect_frame.shape[1]
-                        # scale_y считаем к полной высоте уменьшенного кадра ДО кропа
-                        scale_y = image_np.shape[0] / pre_crop_h
-                        # Смещение crop_top в координатах полного кадра
-                        crop_top_full = int(crop_top * scale_y)
-                        for det in detections:
-                            x1, y1, x2, y2 = det['bbox']
-                            det['bbox'] = (
-                                int(x1 * scale_x),
-                                int(y1 * scale_y) + crop_top_full,
-                                int(x2 * scale_x),
-                                int(y2 * scale_y) + crop_top_full,
-                            )
-                            center = det.get('center')
-                            if center is not None:
-                                det['center'] = (int(center[0] * scale_x), int(center[1] * scale_y) + crop_top_full)
+                # Забираем свежий результат детекции, если детектор успел его посчитать
+                fresh_detections = None
+                while True:
+                    try:
+                        _, fresh_detections = self.result_queue.get_nowait()
+                    except queue.Empty:
+                        break
 
+                if fresh_detections is not None:
+                    detections = fresh_detections
                     blue_cones = []
                     yellow_cones = []
                     orange_cones = []
@@ -412,7 +477,7 @@ class VisionLoop:
                         if o_z < self.config.stop_cone_z_threshold: 
                             target_detected = True
 
-                    if self.config.draw_trajectory and should_process:
+                    if self.config.draw_trajectory:
                         pts_2d = [[image_np.shape[1]//2, image_np.shape[0]]]
                         for wp in waypoints_3d:
                             # Защита от деления на ноль: точки с z <= 0 не проецируем
@@ -446,7 +511,7 @@ class VisionLoop:
                                           self.config.target_cross_thickness)
 
                     # ОТРИСОВКА КОНУСОВ (draw_detections) 
-                    if self.config.draw_detections and should_process:
+                    if self.config.draw_detections:
                         for det in detections:
                             x1, y1, x2, y2 = det['bbox']
                             cone_name = det.get('name', '')
@@ -578,6 +643,12 @@ class VisionLoop:
             pass
         if getattr(self, 'vision_thread', None) is not None and self.vision_thread.is_alive():
             self.vision_thread.join(timeout=self.config.vision_thread_join_timeout)
+        if getattr(self, 'detect_thread', None) is not None and self.detect_thread.is_alive():
+            try:
+                self.detect_queue.put_nowait(None)
+            except queue.Full:
+                pass
+            self.detect_thread.join(timeout=2.0)
         if getattr(self, 'rec_thread', None) is not None and self.rec_thread.is_alive():
             self.rec_queue.put(None)
             self.rec_thread.join(timeout=3.0)
@@ -592,6 +663,7 @@ class VisionLoop:
         start_time = time.time()
         
         while (getattr(self, 'vision_thread', None) is not None and self.vision_thread.is_alive()) or \
+              (getattr(self, 'detect_thread', None) is not None and self.detect_thread.is_alive()) or \
               (getattr(self, 'rec_thread', None) is not None and self.rec_thread.is_alive()):
             if time.time() - start_time > max_wait:
                 logger.warning("Потоки не завершились в течение таймаута, принудительный перезапуск")
@@ -612,6 +684,10 @@ class VisionLoop:
         # Создаём новые потоки только если старые завершились
         self.rec_thread = threading.Thread(target=self._rec_loop, daemon=True)
         self.rec_thread.start()
+        self.detect_queue = queue.Queue(maxsize=1)
+        self.result_queue = queue.Queue(maxsize=1)
+        self.detect_thread = threading.Thread(target=self._detect_loop, daemon=True)
+        self.detect_thread.start()
         self.vision_thread = threading.Thread(target=self._vision_loop, daemon=True)
         self.vision_thread.start()
 

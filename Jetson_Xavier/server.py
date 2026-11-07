@@ -44,11 +44,16 @@ config = Config("config.jsonc")
 start()  # Запуск Web
 
 class VisionLoop:
+    TARGET_TIMEOUT = 0.5
+
     def __init__(self, config, detector, car, robot_state):
         self.config = config
         self.detector = detector
         self.car = car
         self.robot_state = robot_state
+        self.control_lock = threading.Lock()
+        self.last_target_at = None
+        self.last_steering = 0.0
 
         self.zed = sl.Camera()
         self.running = True
@@ -82,15 +87,46 @@ class VisionLoop:
         self.detect_thread = threading.Thread(target=self._detect_loop, daemon=True)
         self.detect_thread.start()
 
-        # Состояние ПИД-регулятора и сглаживания ошибки
+        self._reset_pid()
+
+        self.vision_thread = threading.Thread(target=self._vision_loop, daemon=True)
+        self.vision_thread.start()
+
+    def _reset_pid(self):
         self.pid_integral = 0.0
         self.pid_prev_error = 0.0
         self.pid_prev_time = None
         self.pid_smoothed_error = 0.0
-        self.last_steering = 0.0  # Для graceful degradation
 
-        self.vision_thread = threading.Thread(target=self._vision_loop, daemon=True)
-        self.vision_thread.start()
+    def enable_auto(self):
+        with self.control_lock:
+            if not self.robot_state['cam_connected']:
+                self.robot_state['msg'] = 'АВТОРЕЖИМ НЕДОСТУПЕН: НЕТ КАДРОВ С КАМЕРЫ'
+                self.robot_state['msg_time'] = time.time()
+            elif not self.robot_state['auto_mode']:
+                self.car.stop()
+                self._reset_pid()
+                self.last_target_at = time.monotonic()
+                self.last_steering = 0.0
+                self.robot_state['auto_mode'] = True
+                self.robot_state['msg'] = ''
+
+    def _camera_lost(self):
+        with self.control_lock:
+            self.robot_state['cam_connected'] = False
+            if self.robot_state['auto_mode']:
+                self.robot_state['auto_mode'] = False
+                self.car.stop()
+                self.robot_state['msg'] = 'ПОТЕРЯ КАМЕРЫ: АВТОРЕЖИМ ОТКЛЮЧЁН'
+                self.robot_state['msg_time'] = time.time()
+
+    def check_target_timeout(self):
+        with self.control_lock:
+            if (self.robot_state['auto_mode'] and
+                    time.monotonic() - self.last_target_at >= self.TARGET_TIMEOUT):
+                if self.pid_prev_time is not None:
+                    self._reset_pid()
+                self.car.update(0.0, self.last_steering)
 
     def _detect_loop(self):
         """Детекция YOLO в отдельном потоке.
@@ -107,7 +143,7 @@ class VisionLoop:
             if task is None:
                 break
 
-            frame_id, detect_frame, full_size, pre_crop_h, crop_top = task
+            captured_at, detect_frame, full_size, pre_crop_h, crop_top = task
             try:
                 detections = self.detector.detect(detect_frame)
             except Exception as e:
@@ -138,7 +174,7 @@ class VisionLoop:
             except queue.Empty:
                 pass
             try:
-                self.result_queue.put_nowait((frame_id, detections))
+                self.result_queue.put_nowait((captured_at, detections))
             except queue.Full:
                 pass
 
@@ -207,11 +243,10 @@ class VisionLoop:
           * I-часть убирает систематическое смещение (машину тянет к краю из-за кривого руля);
           * D-часть демпфирует резкие движения руля;
           * EMA-фильтр сглаживает шум от детекции конусов;
-          * error_decay_rate плавно возвращает руль в центр при потере цели.
         Все коэффициенты берутся из блока 'pid' в config.jsonc.
         """
         cfg = self.config
-        now = time.time()
+        now = time.monotonic()
 
         # EMA-сглаживание ошибки
         self.pid_smoothed_error = cfg.ema_alpha * error + (1.0 - cfg.ema_alpha) * self.pid_smoothed_error
@@ -222,12 +257,13 @@ class VisionLoop:
             dt = max(now - self.pid_prev_time, cfg.min_dt)
             derivative = (err - self.pid_prev_error) / dt
         else:
+            dt = 0.0
             derivative = 0.0
         self.pid_prev_time = now
         self.pid_prev_error = err
 
         # Интеграл с анти-windup (клиппинг по max_integral)
-        self.pid_integral += cfg.ki_gain * err * dt if self.pid_prev_time else 0.0
+        self.pid_integral += cfg.ki_gain * err * dt
         self.pid_integral = max(-cfg.max_integral, min(cfg.max_integral, self.pid_integral))
 
         # Выход ПИД
@@ -266,6 +302,14 @@ class VisionLoop:
         return target
 
     def _vision_loop(self):
+        try:
+            self._capture_loop()
+        except Exception:
+            logger.exception('Поток камеры завершился с ошибкой')
+        finally:
+            self._camera_lost()
+
+    def _capture_loop(self):
         init_params = sl.InitParameters()
         init_params.camera_resolution = getattr(sl.RESOLUTION, self.config.zed_resolution, sl.RESOLUTION.HD720)
         init_params.camera_fps = min(int(self.config.fps), 30)  # камера не выше 30 FPS
@@ -275,11 +319,9 @@ class VisionLoop:
        
         if self.zed.open(init_params) != sl.ERROR_CODE.SUCCESS:
             logger.error("Не удалось открыть ZED-камеру.")
-            self.robot_state['cam_connected'] = False
             self.running = False
             return
 
-        self.robot_state['cam_connected'] = True
         cam_info = self.zed.get_camera_information()
         self.fx = cam_info.camera_configuration.calibration_parameters.left_cam.fx
         self.cx_cam = cam_info.camera_configuration.calibration_parameters.left_cam.cx
@@ -289,7 +331,7 @@ class VisionLoop:
 
         fps_counter = 0
         current_fps = 0
-        fps_last_time = time.time()
+        fps_last_time = time.monotonic()
         rec_timestamp = None
         was_recording = False
 
@@ -304,11 +346,11 @@ class VisionLoop:
                 grab_result = self.zed.grab(runtime_params)
                 
                 if grab_result != sl.ERROR_CODE.SUCCESS:
+                    self._camera_lost()
                     grab_error_count += 1
                     
                     if grab_error_count >= max_grab_errors:
                         logger.error("Ошибка захвата кадра. Переподключение камеры...")
-                        self.robot_state['cam_connected'] = False
                         self._reconnect_camera(init_params)
                         grab_error_count = 0
                         continue
@@ -319,11 +361,12 @@ class VisionLoop:
                 grab_error_count = 0
             except Exception as e:
                 logger.error(f"Исключение при grab(): {e}")
-                self.robot_state['cam_connected'] = False
+                self._camera_lost()
                 time.sleep(0.5)
                 continue
 
             if grab_result == sl.ERROR_CODE.SUCCESS:
+                captured_at = time.monotonic()
                 self.zed.retrieve_image(image_zed, sl.VIEW.LEFT)
                 
                 img_data = image_zed.get_data()
@@ -335,6 +378,11 @@ class VisionLoop:
                     image_np = cv2.cvtColor(img_data, cv2.COLOR_BGRA2BGR)
                 else:
                     image_np = img_data
+
+                with self.control_lock:
+                    if not self.running:
+                        break
+                    self.robot_state['cam_connected'] = True
 
                 detect_frame = image_np
                 if image_np.shape[1] > 640 or image_np.shape[0] > 480:
@@ -364,7 +412,7 @@ class VisionLoop:
                 # Кадр уходит в отдельный поток детекции: инференс YOLO
                 # не блокирует захват кадров и публикацию в веб (это и был затык на 8 FPS)
                 if should_process:
-                    task = (self.frame_counter,
+                    task = (captured_at,
                             detect_frame.copy(),
                             (image_np.shape[1], image_np.shape[0]),
                             pre_crop_h,
@@ -388,7 +436,7 @@ class VisionLoop:
                 fresh_detections = None
                 while True:
                     try:
-                        _, fresh_detections = self.result_queue.get_nowait()
+                        detected_at, fresh_detections = self.result_queue.get_nowait()
                     except queue.Empty:
                         break
 
@@ -545,29 +593,24 @@ class VisionLoop:
                                         self.config.pair_line_thickness)
 
                     # УПРАВЛЕНИЕ 
-                    if self.robot_state.get('auto_mode', False):
-                        if target_detected:
-                            self.robot_state['auto_mode'] = False
-                            self.robot_state['msg'] = "ФИНИШ! ОРАНЖЕВЫЙ КОНУС."
-                            self.robot_state['msg_time'] = time.time()
-                            def _brake(car=self.car):
-                                car.stop()
-                            threading.Thread(target=_brake, daemon=True).start()
-                        elif target_x is not None and target_z is not None and target_z > 0:
-                            error = math.atan2(target_x, target_z)
-                            # Используем steer_k из выбранной точки (если есть), иначе дефолтный
-                            steer_k = target_wp.get('steer_k', 2.0) if target_wp else 2.0
-                            # Используем PID-регулятор вместо простого error * steer_k
-                            steering = self._pid_steering(error, steer_k)
-                            self.last_steering = steering
-                            self.car.update(1.0, steering)
-                        else:
-                            # Graceful degradation: плавное возвращение руля в центр
-                            self.last_steering *= self.config.error_decay_rate
-                            if abs(self.last_steering) > 0.01:
-                                self.car.update(self.config.graceful_degradation_speed, self.last_steering)
-                            else:
-                                self.car.update(0.0, 0.0)
+                    with self.control_lock:
+                        if (self.robot_state['auto_mode'] and
+                                detected_at >= self.last_target_at and
+                                time.monotonic() - detected_at < self.TARGET_TIMEOUT):
+                            if target_detected:
+                                self.robot_state['auto_mode'] = False
+                                self.car.stop()
+                                self.robot_state['msg'] = "ФИНИШ! ОРАНЖЕВЫЙ КОНУС."
+                                self.robot_state['msg_time'] = time.time()
+                            elif target_x is not None and target_z > 0:
+                                if detected_at - self.last_target_at >= self.TARGET_TIMEOUT:
+                                    self._reset_pid()
+                                self.last_target_at = detected_at
+                                error = math.atan2(target_x, target_z)
+                                steer_k = target_wp.get('steer_k', 2.0)
+                                steering = self._pid_steering(error, steer_k)
+                                self.last_steering = steering
+                                self.car.update(1.0, steering)
 
                     self.last_detections = detections
                     self.last_waypoints_3d = waypoints_3d
@@ -579,10 +622,12 @@ class VisionLoop:
 
                 # FPS
                 fps_counter += 1
-                if time.time() - fps_last_time >= self.config.fps_update_interval:
-                    current_fps = fps_counter
+                fps_now = time.monotonic()
+                fps_elapsed = fps_now - fps_last_time
+                if fps_elapsed > 0 and fps_elapsed >= self.config.fps_update_interval:
+                    current_fps = round(fps_counter / fps_elapsed, 1)
                     fps_counter = 0
-                    fps_last_time = time.time()
+                    fps_last_time = fps_now
                 
                 if self.config.draw_fps:
                     cv2.putText(image_np, f"FPS: {current_fps} Mode: {'AUTO' if self.robot_state.get('auto_mode') else 'MANUAL'}", 
@@ -617,7 +662,6 @@ class VisionLoop:
                     set_frame(image_np)
 
         self.zed.close()
-        self.robot_state['cam_connected'] = False
     
     def _reconnect_camera(self, init_params):
         """Попытка переподключения к камере"""
@@ -630,19 +674,15 @@ class VisionLoop:
         try:
             self.zed = sl.Camera()
             if self.zed.open(init_params) == sl.ERROR_CODE.SUCCESS:
-                self.robot_state['cam_connected'] = True
                 cam_info = self.zed.get_camera_information()
                 self.fx = cam_info.camera_configuration.calibration_parameters.left_cam.fx
                 self.cx_cam = cam_info.camera_configuration.calibration_parameters.left_cam.cx
-            else:
-                self.robot_state['cam_connected'] = False
         except Exception as e:
             logger.error(f"Ошибка переподключения камеры: {e}")
-            self.robot_state['cam_connected'] = False
 
     def close(self):
         self.running = False
-        self.robot_state['cam_connected'] = False
+        self._camera_lost()
         try:
             if getattr(self, 'zed', None) is not None:
                 self.zed.close()
@@ -657,7 +697,10 @@ class VisionLoop:
                 pass
             self.detect_thread.join(timeout=2.0)
         if getattr(self, 'rec_thread', None) is not None and self.rec_thread.is_alive():
-            self.rec_queue.put(None)
+            try:
+                self.rec_queue.put_nowait(None)
+            except queue.Full:
+                pass  # Поток завершится по running=False после текущей записи.
             self.rec_thread.join(timeout=3.0)
         self.zed = None
 
@@ -673,8 +716,8 @@ class VisionLoop:
               (getattr(self, 'detect_thread', None) is not None and self.detect_thread.is_alive()) or \
               (getattr(self, 'rec_thread', None) is not None and self.rec_thread.is_alive()):
             if time.time() - start_time > max_wait:
-                logger.warning("Потоки не завершились в течение таймаута, принудительный перезапуск")
-                break
+                logger.error("Перезапуск отменён: старые потоки ещё не завершились")
+                return False
             time.sleep(0.1)
         
         # Дополнительная пауза для стабилизации
@@ -697,11 +740,12 @@ class VisionLoop:
         self.detect_thread.start()
         self.vision_thread = threading.Thread(target=self._vision_loop, daemon=True)
         self.vision_thread.start()
+        return True
 
 
 def main():
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    sock.settimeout(config.socket_timeout)
+    sock.settimeout(min(config.socket_timeout, 0.02))
     try:
         sock.bind((config.udp_ip, config.udp_port))
     except:
@@ -717,6 +761,7 @@ def main():
     
     try:
         while running:
+            loop.check_target_timeout()
             try:
                 data, addr = sock.recvfrom(1024)
                 last_addr = addr
@@ -725,20 +770,20 @@ def main():
                     running = False
                     break
                 elif command == "A":
-                    if not robot_state['auto_mode']:
-                        robot_state['auto_mode'] = True
-                        robot_state['msg'] = ''
+                    loop.enable_auto()
                 elif command == "S":
-                    if robot_state['auto_mode']:
-                        robot_state['auto_mode'] = False
-                        car.stop()
+                    with loop.control_lock:
+                        if robot_state['auto_mode']:
+                            robot_state['auto_mode'] = False
+                            car.stop()
                 elif command == "R":
                     loop.is_recording = True
                 elif command == "C":
                     loop.is_recording = False
                 elif command == "F":
                     # ПЕРЕЗАГРУЗКА: отключение и повторное включение системы
-                    robot_state['auto_mode'] = False
+                    with loop.control_lock:
+                        robot_state['auto_mode'] = False
                     robot_state['msg'] = 'ПЕРЕЗАГРУЗКА...'
                     robot_state['msg_time'] = time.time()
                     logger.info("Инициирована перезагрузка системы...")
@@ -756,16 +801,16 @@ def main():
                     time.sleep(0.5)
                     
                     # Повторное включение камеры
-                    robot_state['cam_connected'] = False
-                    loop.restart()
+                    vision_restarted = loop.restart()
                     time.sleep(1.0)
                     
                     # Обновляем статусы подключения
-                    robot_state['cam_connected'] = loop.robot_state.get('cam_connected', False)
                     robot_state['arduino_connected'] = car.arduino is not None
-                    robot_state['msg'] = 'СИСТЕМА ПЕРЕЗАГРУЖЕНА!'
+                    robot_state['msg'] = ('СИСТЕМА ПЕРЕЗАГРУЖЕНА!'
+                                          if vision_restarted and robot_state['cam_connected'] and robot_state['arduino_connected']
+                                          else 'ОШИБКА ПЕРЕЗАГРУЗКИ: ПРОВЕРЬТЕ ПОДКЛЮЧЕНИЯ И ПОТОКИ')
                     robot_state['msg_time'] = time.time()
-                    logger.info("Система успешно перезагружена!")
+                    logger.info(robot_state['msg'])
                 elif command.startswith("speed:"):
                     try:
                         parts = command[len("speed:"):].split(',')
@@ -781,11 +826,12 @@ def main():
                 else:
                     try:
                         speed, steering = map(float, command.split(','))
-                        if robot_state['auto_mode'] and (speed != 0.0 or steering != 0.0):
-                            robot_state['auto_mode'] = False
-                            robot_state['msg_time'] = time.time()
-                        if not robot_state['auto_mode']:
-                            car.update(speed, steering)
+                        with loop.control_lock:
+                            if robot_state['auto_mode'] and (speed != 0.0 or steering != 0.0):
+                                robot_state['auto_mode'] = False
+                                robot_state['msg_time'] = time.time()
+                            if not robot_state['auto_mode']:
+                                car.update(speed, steering)
                     except:
                         pass
 
@@ -807,14 +853,22 @@ def main():
                 if last_addr:
                     sock.sendto(json.dumps(telemetry).encode('utf-8'), last_addr)
             except socket.timeout:
-                if not robot_state['auto_mode']:
-                    car.check_stop()
+                with loop.control_lock:
+                    if not robot_state['auto_mode']:
+                        car.check_stop()
     except KeyboardInterrupt:
         pass
     finally:
-        loop.close()
-        car.close()
-        sock.close()
+        with loop.control_lock:
+            robot_state['auto_mode'] = False
+            car.stop()
+        try:
+            loop.close()
+        finally:
+            try:
+                car.close()
+            finally:
+                sock.close()
 
 
 if __name__ == "__main__":

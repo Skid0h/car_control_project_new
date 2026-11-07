@@ -18,7 +18,9 @@ class Config:
         with open(config_path, 'r', encoding='utf-8') as f:
             content = f.read()
         
-        content = re.sub(r'//.*', '', content)
+        # Сохраняем строки JSON, включая URL и экранированные кавычки.
+        content = re.sub(r'("(?:\\.|[^"\\])*")|//[^\r\n]*',
+                         lambda match: match.group(1) or '', content)
         cfg = json.loads(content)
         
         # Network

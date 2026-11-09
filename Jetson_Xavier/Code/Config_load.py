@@ -71,14 +71,16 @@ class Config:
         self.yolo_model_path = vis['yolo_model_path']
         self.confidence_threshold = vis['confidence_threshold']
         self.iou_threshold = vis['iou_threshold']
-        # ЕДИНЫЙ параметр fps: управляет камерой ZED, обработкой и веб-стримом
-        self.fps = int(vis.get('fps', 30))
-        self.target_fps = float(self.fps)   # внутренний алиас
+        # fps задаёт отрисовку и стрим, camera_fps — захват и основной цикл.
+        self.fps = int(vis.get('fps', 15))
+        self.zed_fps = int(vis.get('camera_fps', 30))
+        if not 1 <= self.fps <= self.zed_fps <= 30:
+            raise ValueError('Требуется 1 <= vision.fps <= vision.camera_fps <= 30')
+        self.target_fps = float(self.zed_fps)
         self.output_folder = vis['output_folder']
         self.camera_offset_x = vis['camera_offset_x']
         self.camera_offset_z = vis['camera_offset_z']
         self.zed_resolution = vis['zed_resolution']
-        self.zed_fps = self.fps             # внутренний алиас
         self.depth_mode = vis['depth_mode']
         self.coordinate_units = vis['coordinate_units']
         self.cone_base_v = vis['cone_base_v']

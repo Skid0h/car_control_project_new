@@ -38,7 +38,8 @@ class ConeDetector:
                if result.boxes is None:
                    continue
 
-               for box in result.boxes:
+               # Переносим результаты на CPU одним пакетом перед разбором рамок.
+               for box in result.boxes.cpu():
                    x1, y1, x2, y2 = map(int, box.xyxy[0])
                    conf = float(box.conf[0])
                    cls_id = int(box.cls[0])

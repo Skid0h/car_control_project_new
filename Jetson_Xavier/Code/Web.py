@@ -32,15 +32,16 @@ def set_frame(frame):
     """Основной код вызывает эту функцию чтобы обновить кадр"""
     global current_jpeg, frame_seq
     if frame is None:
-        return
+        return False
     ret, jpeg = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 70])
     if not ret:
-        return
+        return False
     jpeg_bytes = jpeg.tobytes()
     with frame_cond:
         current_jpeg = jpeg_bytes
         frame_seq += 1  # Увеличиваем счётчик для отслеживания новых кадров
         frame_cond.notify_all()  # Будим всех ждущих зрителей
+    return True
 
 @app.route('/')
 def index():

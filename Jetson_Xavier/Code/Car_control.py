@@ -1,4 +1,5 @@
 import time
+import math
 import serial
 import threading
 import serial.tools.list_ports
@@ -28,6 +29,7 @@ class CarController:
         self.last_sent_cmd     = ""                                     # Последняя отправленная строка команды
         self.arduino = None
         self.current_speed   = 0.0                                      # Текущая скорость с датчика (м/с)
+        self._speed_sample = (0.0, 0.0)
         self._reader_thread  = None                                     # Поток чтения скорости из UART
 
         port = find_arduino_port()
@@ -65,20 +67,22 @@ class CarController:
             if not line:
                 continue
             # Формат от Arduino: "S:12.34" (или debug-строка "Speed: 12.34")
-            if line.startswith('S:'):
+            if line.startswith(('S:', 'Speed:')):
                 try:
-                    self.current_speed = float(line[2:])
+                    speed = float(line.split(':', 1)[1])
                 except ValueError:
-                    pass
-            elif line.startswith('Speed:'):
-                try:
-                    self.current_speed = float(line.split(':', 1)[1])
-                except (ValueError, IndexError):
-                    pass
+                    continue
+                if (math.isfinite(speed) and self.arduino is ser and
+                        generation == self._reader_generation):
+                    self.current_speed = speed
+                    self._speed_sample = (speed, time.monotonic())
 
     def get_speed(self):
         """Текущая скорость машины по датчику, м/с"""
-        return self.current_speed
+        speed, received_at = self._speed_sample
+        if self.arduino is None or time.monotonic() - received_at >= 0.5:
+            return 0.0
+        return speed
    
     def set_speeds(self, forward, back):
         self.config.forward_speed = forward
@@ -134,6 +138,8 @@ class CarController:
         
     def close(self):
         self.stop()
+        self._speed_sample = (0.0, 0.0)
+        self.current_speed = 0.0
         time.sleep(self.config.arduino_close_delay)
         if self.arduino: self.arduino.close()
         self.arduino = None

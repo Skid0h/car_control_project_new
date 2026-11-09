@@ -59,12 +59,9 @@ class VisionLoop:
         self.running = True
         self.is_recording = False
         self.frame_counter = 0
-        # ЕДИНЫЙ параметр fps (config.fps): камера, обработка и веб-стрим (макс. 30).
-        # Детекция YOLO вынесена в отдельный поток (detect_thread),
-        # поэтому инференс (~125 мс) больше не блокирует цикл камеры.
-        self.target_fps = min(float(self.config.fps), 30.0)
+        # Камера и обработка работают чаще отрисовки и публикации.
         self.process_every = 1
-        self.publish_every = 1
+        self.last_detection_at = 0.0
         self.last_detections = []
         self.last_waypoints_3d = []
         self.last_target_x = None
@@ -301,6 +298,65 @@ class VisionLoop:
                 break
         return target
 
+    def _draw_overlay(self, image_np, detections, waypoints_3d, target_x, target_z):
+        for det in detections:
+            if self.config.draw_target_z and 'pos_3d' in det:
+                x1, y1, _, _ = det['bbox']
+                cv2.putText(image_np, f"Z:{det['pos_3d'][1]:.1f}m", (x1, y1 - 25),
+                            cv2.FONT_HERSHEY_SIMPLEX, self.config.z_text_scale,
+                            self.config.z_text_color, self.config.z_text_thickness)
+        if self.config.draw_trajectory:
+            pts_2d = [[image_np.shape[1]//2, image_np.shape[0]]]
+            for wp in waypoints_3d:
+                # Защита от деления на ноль: точки с z <= 0 не проецируем
+                if wp['z'] <= 0:
+                    continue
+                u = int((wp['x'] * self.fx / wp['z']) + self.cx_cam)
+                v = int(image_np.shape[0] * self.config.cone_base_v)
+                pts_2d.append([u, v])
+            if len(pts_2d) > 1:
+                pts_arr = np.array(pts_2d, np.int32).reshape((-1, 1, 2))
+                cv2.polylines(image_np, [pts_arr], isClosed=False, 
+                             color=self.config.trajectory_color, 
+                             thickness=self.config.trajectory_thickness)
+
+        # Отрисовка цели только если z корректен для проекции
+        if self.config.draw_target and target_z is not None and target_z > 0:
+            target_u = int((target_x * self.fx / target_z) + self.cx_cam)
+            target_v = int(image_np.shape[0] * self.config.cone_base_v)
+            cv2.drawMarker(image_np, (target_u, target_v), (0, 0, 255), 
+                          cv2.MARKER_CROSS, 
+                          self.config.target_cross_size, 
+                          self.config.target_cross_thickness)
+
+        # ОТРИСОВКА КОНУСОВ (draw_detections) 
+        if self.config.draw_detections:
+            for det in detections:
+                x1, y1, x2, y2 = det['bbox']
+                cone_name = det.get('name', '')
+                
+                if cone_name in self.config.blue_cones:
+                    color = (255, 0, 0)
+                elif cone_name in self.config.yellow_cones:
+                    color = (0, 255, 255)
+                elif cone_name in self.config.orange_cones:
+                    color = (0, 165, 255)
+                else:
+                    color = (255, 255, 255)
+                
+                cv2.rectangle(image_np, (x1, y1), (x2, y2), color, 2)
+                cv2.putText(image_np, cone_name, (x1, y1-10), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+
+        # ЛИНИИ МЕЖДУ ПАРАМИ 
+        if self.config.pair_line_color:
+            for wp in waypoints_3d:
+                if wp.get('type') == 'pair':
+                    cv2.line(image_np, wp['b_cone']['center'], wp['y_cone']['center'], 
+                            self.config.pair_line_color, 
+                            self.config.pair_line_thickness)
+
+
     def _vision_loop(self):
         try:
             self._capture_loop()
@@ -312,9 +368,9 @@ class VisionLoop:
     def _capture_loop(self):
         init_params = sl.InitParameters()
         init_params.camera_resolution = getattr(sl.RESOLUTION, self.config.zed_resolution, sl.RESOLUTION.HD720)
-        init_params.camera_fps = min(int(self.config.fps), 30)  # камера не выше 30 FPS
+        init_params.camera_fps = self.config.zed_fps
         init_params.coordinate_units = getattr(sl.UNIT, self.config.coordinate_units, sl.UNIT.METER)
-        # Пункт 8: применяем режим глубины из конфига (PERFORMANCE / QUALITY / ULTRA)
+        # NONE отключает вычисление неиспользуемой карты глубины.
         init_params.depth_mode = getattr(sl.DEPTH_MODE, self.config.depth_mode, sl.DEPTH_MODE.PERFORMANCE)
        
         if self.zed.open(init_params) != sl.ERROR_CODE.SUCCESS:
@@ -327,10 +383,14 @@ class VisionLoop:
         self.cx_cam = cam_info.camera_configuration.calibration_parameters.left_cam.cx
 
         runtime_params = sl.RuntimeParameters()
+        runtime_params.enable_depth = self.config.depth_mode != 'NONE'
         image_zed = sl.Mat()
 
         fps_counter = 0
+        stream_counter = 0
         current_fps = 0
+        current_stream_fps = 0.0
+        publish_phase = 0
         fps_last_time = time.monotonic()
         rec_timestamp = None
         was_recording = False
@@ -339,9 +399,10 @@ class VisionLoop:
         max_grab_errors = 5
 
         logger.info(f"Обычный автопилот: Оценка глубины по площади + Блокировка виртуальных точек.")
-        logger.info(f"FPS: камера={init_params.camera_fps}, target={self.target_fps}, process_every={self.process_every}, publish_every={self.publish_every}, детекция в отдельном потоке")
+        logger.info(f"FPS: камера/цикл={init_params.camera_fps}, отрисовка/стрим={self.config.fps}, детекция в отдельном потоке")
 
         while self.running:
+            # Частоту захвата задаёт камера, отдельная задержка здесь не нужна.
             try:
                 grab_result = self.zed.grab(runtime_params)
                 
@@ -370,10 +431,12 @@ class VisionLoop:
                 self.zed.retrieve_image(image_zed, sl.VIEW.LEFT)
                 
                 img_data = image_zed.get_data()
+                gpu_bgr = None
                 if CUDA_AVAILABLE and img_data.shape[2] == 4:
                     gpu_src = cv2.cuda_GpuMat()
                     gpu_src.upload(img_data)
-                    image_np = cv2.cuda.cvtColor(gpu_src, cv2.COLOR_BGRA2BGR).download()
+                    gpu_bgr = cv2.cuda.cvtColor(gpu_src, cv2.COLOR_BGRA2BGR)
+                    image_np = gpu_bgr.download()
                 elif img_data.shape[2] == 4:
                     image_np = cv2.cvtColor(img_data, cv2.COLOR_BGRA2BGR)
                 else:
@@ -393,9 +456,10 @@ class VisionLoop:
                         new_w = max(320, int(image_np.shape[1] * scale))
                         new_h = max(180, int(image_np.shape[0] * scale))
                         if CUDA_AVAILABLE:
-                            gpu_img = cv2.cuda_GpuMat()
-                            gpu_img.upload(image_np)
-                            detect_frame = cv2.cuda.resize(gpu_img, (new_w, new_h)).download()
+                            if gpu_bgr is None:
+                                gpu_bgr = cv2.cuda_GpuMat()
+                                gpu_bgr.upload(image_np)
+                            detect_frame = cv2.cuda.resize(gpu_bgr, (new_w, new_h)).download()
                         else:
                             detect_frame = cv2.resize(image_np, (new_w, new_h), interpolation=cv2.INTER_AREA)
 
@@ -441,6 +505,7 @@ class VisionLoop:
                         break
 
                 if fresh_detections is not None:
+                    self.last_detection_at = detected_at
                     detections = fresh_detections
                     blue_cones = []
                     yellow_cones = []
@@ -459,13 +524,6 @@ class VisionLoop:
                             x_cam = (u - self.cx_cam) * z / self.fx
                             # Учитываем смещение камеры относительно центра машины по X
                             det['pos_3d'] = (x_cam - self.config.camera_offset_x, z - self.config.camera_offset_z)
-                            
-                            if self.config.draw_target_z:
-                                cv2.putText(image_np, f"Z:{z:.1f}m", (x1, y1-25), 
-                                           cv2.FONT_HERSHEY_SIMPLEX, 
-                                           self.config.z_text_scale, 
-                                           self.config.z_text_color, 
-                                           self.config.z_text_thickness)
                             
                             cone_name = det.get('name', '')
                             if cone_name in self.config.blue_cones:
@@ -532,21 +590,6 @@ class VisionLoop:
                         if o_z < self.config.stop_cone_z_threshold: 
                             target_detected = True
 
-                    if self.config.draw_trajectory:
-                        pts_2d = [[image_np.shape[1]//2, image_np.shape[0]]]
-                        for wp in waypoints_3d:
-                            # Защита от деления на ноль: точки с z <= 0 не проецируем
-                            if wp['z'] <= 0:
-                                continue
-                            u = int((wp['x'] * self.fx / wp['z']) + self.cx_cam)
-                            v = int(image_np.shape[0] * self.config.cone_base_v)
-                            pts_2d.append([u, v])
-                        if len(pts_2d) > 1:
-                            pts_arr = np.array(pts_2d, np.int32).reshape((-1, 1, 2))
-                            cv2.polylines(image_np, [pts_arr], isClosed=False, 
-                                         color=self.config.trajectory_color, 
-                                         thickness=self.config.trajectory_thickness)
-
                     target_x, target_z = None, None
                     target_wp = None
                     if len(waypoints_3d) > 0:
@@ -556,42 +599,6 @@ class VisionLoop:
                             target_x = target_wp['x']
                             target_z = target_wp['z']
                         
-                        # Отрисовка цели только если z корректен для проекции
-                        if self.config.draw_target and target_z > 0:
-                            target_u = int((target_x * self.fx / target_z) + self.cx_cam)
-                            target_v = int(image_np.shape[0] * self.config.cone_base_v)
-                            cv2.drawMarker(image_np, (target_u, target_v), (0, 0, 255), 
-                                          cv2.MARKER_CROSS, 
-                                          self.config.target_cross_size, 
-                                          self.config.target_cross_thickness)
-
-                    # ОТРИСОВКА КОНУСОВ (draw_detections) 
-                    if self.config.draw_detections:
-                        for det in detections:
-                            x1, y1, x2, y2 = det['bbox']
-                            cone_name = det.get('name', '')
-                            
-                            if cone_name in self.config.blue_cones:
-                                color = (255, 0, 0)
-                            elif cone_name in self.config.yellow_cones:
-                                color = (0, 255, 255)
-                            elif cone_name in self.config.orange_cones:
-                                color = (0, 165, 255)
-                            else:
-                                color = (255, 255, 255)
-                            
-                            cv2.rectangle(image_np, (x1, y1), (x2, y2), color, 2)
-                            cv2.putText(image_np, cone_name, (x1, y1-10), 
-                                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
-
-                    # ЛИНИИ МЕЖДУ ПАРАМИ 
-                    if self.config.pair_line_color and pairs_found_count > 0:
-                        for wp in waypoints_3d:
-                            if wp.get('type') == 'pair':
-                                cv2.line(image_np, wp['b_cone']['center'], wp['y_cone']['center'], 
-                                        self.config.pair_line_color, 
-                                        self.config.pair_line_thickness)
-
                     # УПРАВЛЕНИЕ 
                     with self.control_lock:
                         if (self.robot_state['auto_mode'] and
@@ -618,7 +625,9 @@ class VisionLoop:
                     self.last_target_z = target_z
                     self.last_target_detected = target_detected
 
-                # Пункт 9: else-ветка удалена — в начале блока уже присвоены last_* значения
+                if time.monotonic() - self.last_detection_at >= self.TARGET_TIMEOUT:
+                    detections, waypoints_3d = [], []
+                    target_x, target_z = None, None
 
                 # FPS
                 fps_counter += 1
@@ -626,20 +635,38 @@ class VisionLoop:
                 fps_elapsed = fps_now - fps_last_time
                 if fps_elapsed > 0 and fps_elapsed >= self.config.fps_update_interval:
                     current_fps = round(fps_counter / fps_elapsed, 1)
+                    current_stream_fps = stream_counter / fps_elapsed
                     fps_counter = 0
+                    stream_counter = 0
                     fps_last_time = fps_now
+
+                # При 30/15 публикуем каждый второй кадр. Дробные отношения
+                # распределяются равномерно без задержки цикла управления.
+                publish_phase += self.config.fps
+                if publish_phase < self.config.zed_fps:
+                    continue
+                publish_phase -= self.config.zed_fps
+                self._draw_overlay(image_np, detections, waypoints_3d, target_x, target_z)
                 
                 if self.config.draw_fps:
-                    cv2.putText(image_np, f"FPS: {current_fps} Mode: {'AUTO' if self.robot_state.get('auto_mode') else 'MANUAL'}", 
-                               (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 
-                               self.config.fps_text_scale, self.config.fps_text_color, self.config.fps_text_thickness)
+                    processing_text = f"PROC {current_fps:.1f} / "
+                    cv2.putText(image_np, processing_text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX,
+                                self.config.fps_text_scale, (0, 255, 0), self.config.fps_text_thickness)
+                    (text_width, _), _ = cv2.getTextSize(processing_text, cv2.FONT_HERSHEY_SIMPLEX,
+                                                       self.config.fps_text_scale, self.config.fps_text_thickness)
+                    cv2.putText(image_np, f"STREAM {current_stream_fps:.1f}", (10 + text_width, 30),
+                                cv2.FONT_HERSHEY_SIMPLEX, self.config.fps_text_scale,
+                                (0, 0, 255), self.config.fps_text_thickness)
+                    cv2.putText(image_np, 'AUTO' if self.robot_state['auto_mode'] else 'MANUAL',
+                                (image_np.shape[1] - 150, 30), cv2.FONT_HERSHEY_SIMPLEX,
+                                self.config.fps_text_scale, self.config.fps_text_color, self.config.fps_text_thickness)
                 if target_x is not None and self.config.draw_target_z:
-                    cv2.putText(image_np, f"Target Z: {target_z:.2f}m", (10, 85), cv2.FONT_HERSHEY_SIMPLEX, 
+                    cv2.putText(image_np, f"Target Z: {target_z:.2f}m", (10, 115), cv2.FONT_HERSHEY_SIMPLEX, 
                                self.config.target_z_text_scale, self.config.target_z_text_color, self.config.target_z_text_thickness)
                 
                 # Скорость с датчика Arduino (чуть ниже FPS/Target Z)
                 if self.config.draw_speed and self.car is not None:
-                    cv2.putText(image_np, f"Speed: {self.car.get_speed():.2f} m/s", (10, 115), cv2.FONT_HERSHEY_SIMPLEX,
+                    cv2.putText(image_np, f"Speed: {self.car.get_speed() * 3.6:.2f} km/h", (10, 85), cv2.FONT_HERSHEY_SIMPLEX,
                                self.config.speed_text_scale, self.config.speed_text_color, self.config.speed_text_thickness)
                 
                 # ЗАПИСЬ
@@ -658,8 +685,8 @@ class VisionLoop:
                         was_recording = False
 
                 # ОТПРАВКА НА WEB
-                if self.frame_counter % self.publish_every == 0:
-                    set_frame(image_np)
+                if set_frame(image_np):
+                    stream_counter += 1
 
         self.zed.close()
     
@@ -725,6 +752,7 @@ class VisionLoop:
         
         # Пересоздаём объекты
         self.running = True
+        self.last_detection_at = 0.0
         self.is_recording = False
         self.fx = 0
         self.cx_cam = 0

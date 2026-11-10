@@ -38,8 +38,10 @@ from Code.Web import start, set_frame
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
 logger = logging.getLogger(__name__)
+pid_logger = logging.getLogger(f"{__name__}.pid")
 
 config = Config("config.jsonc")
+pid_logger.setLevel(logging.DEBUG if config.pid_debug else logging.INFO)
 
 start()  # Запуск Web
 
@@ -239,7 +241,7 @@ class VisionLoop:
         except Exception as e:
             logger.error(f"Ошибка конвертации: {e}")
 
-    def _pid_steering(self, error, steer_limit):
+    def _pid_steering(self, error, steer_limit, captured_at):
         """ПИД-регулятор руля с EMA-сглаживанием ошибки и анти-windup.
 
         В отличие от простого P (steering = error * k), здесь:
@@ -249,20 +251,19 @@ class VisionLoop:
         Все коэффициенты берутся из блока 'pid' в config.jsonc.
         """
         cfg = self.config
-        now = time.monotonic()
-
         # EMA-сглаживание ошибки
         self.pid_smoothed_error = cfg.ema_alpha * error + (1.0 - cfg.ema_alpha) * self.pid_smoothed_error
         err = self.pid_smoothed_error
 
         # Производная: d(err)/dt
         if self.pid_prev_time is not None:
-            dt = max(now - self.pid_prev_time, cfg.min_dt)
+            # Интервал между кадрами, а не между получением результатов YOLO.
+            dt = max(captured_at - self.pid_prev_time, cfg.min_dt)
             derivative = (err - self.pid_prev_error) / dt
         else:
             dt = 0.0
             derivative = 0.0
-        self.pid_prev_time = now
+        self.pid_prev_time = captured_at
         self.pid_prev_error = err
 
         # Интеграл с анти-windup (клиппинг по max_integral)
@@ -270,12 +271,17 @@ class VisionLoop:
         self.pid_integral = max(-cfg.max_integral, min(cfg.max_integral, self.pid_integral))
 
         # Выход ПИД
-        output = cfg.kp_gain * err + self.pid_integral + cfg.kd_gain * derivative
+        proportional = cfg.kp_gain * err
+        differential = cfg.kd_gain * derivative
+        raw_output = cfg.max_steering_output * (proportional + self.pid_integral + differential)
 
         # Ограничение максимального хода руля и приведение к [-1, 1]
         steer_limit = max(0.0, min(1.0, steer_limit))
-        output = cfg.max_steering_output * output
-        output = max(-steer_limit, min(steer_limit, output))
+        output = max(-steer_limit, min(steer_limit, raw_output))
+        pid_logger.debug(
+            "PID dt=%.3fs error=%.3f filtered=%.3f P=%.3f I=%.3f D=%.3f raw=%.3f steer=%.3f",
+            dt, error, err, proportional, self.pid_integral, differential, raw_output, output,
+        )
         return output
 
     def _select_lookahead_target(self, waypoints_3d, lookahead):
@@ -636,7 +642,7 @@ class VisionLoop:
                                 self.last_target_at = detected_at
                                 error = math.atan2(target_x, target_z)
                                 steer_k = target_wp.get('steer_k', 2.0)
-                                steering = self._pid_steering(error, steer_k)
+                                steering = self._pid_steering(error, steer_k, detected_at)
                                 self.last_steering = steering
                                 self.car.update(1.0, steering)
 

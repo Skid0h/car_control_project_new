@@ -11,6 +11,10 @@ import re
 
 
 class Config:
+    # Совместимость с examples/calibrate_depth.py, который читает эти атрибуты.
+    area_depth_constant = 100.0
+    cone_colors = {"yellow": (0, 255, 255), "orange": (0, 165, 255), "blue": (255, 0, 0)}
+
     def cone_distance_from_area(self, area, cone_name):
         """Расстояние от камеры, м; калибровка по площади bbox в исходном кадре."""
         calibration = self.area_depth_calibration.get(cone_name)
@@ -51,6 +55,7 @@ class Config:
         
         # PID
         pid = cfg['pid']
+        self.pid_debug = pid.get('debug', False)
         self.kp_gain = pid['kp_gain']
         self.ki_gain = pid['ki_gain']
         self.kd_gain = pid['kd_gain']
@@ -71,7 +76,6 @@ class Config:
         self.virtual_point_offset = ap['virtual_point_offset']
         self.virtual_steer_k = ap['virtual_steer_k']
         self.stop_cone_z_threshold = ap['stop_cone_z_threshold']
-        self.area_depth_constant = ap['area_depth_constant']
         self.area_depth_calibration = ap.get('area_depth_calibration', {})
         self.graceful_degradation_speed = ap['graceful_degradation_speed']
         
@@ -93,22 +97,16 @@ class Config:
         self.zed_resolution = vis['zed_resolution']
         self.depth_mode = vis['depth_mode']
         self.coordinate_units = vis['coordinate_units']
-        self.cone_base_v = vis['cone_base_v']
         self.point_of_view_offset_y = vis['point_of_view_offset_y']
         self.target_cross_size = vis['target_cross_size']
         self.target_cross_thickness = vis['target_cross_thickness']
         
         # Detection
         det = cfg['detection']
-        self.cone_colors = det['cone_colors']
         self.class_names = det['class_names']
         self.blue_cones = det['blue_cones']
         self.yellow_cones = det['yellow_cones']
         self.orange_cones = det['orange_cones']
-        self.circle_marker_radius = det['circle_marker_radius']
-        self.circle_marker_color = det['circle_marker_color']
-        self.text_scale = det['text_scale']
-        self.text_thickness = det['text_thickness']
         self.z_text_scale = det['z_text_scale']
         self.z_text_thickness = det['z_text_thickness']
         self.z_text_color = det['z_text_color']
@@ -136,10 +134,6 @@ class Config:
         self.rec_text_color = disp['rec_text_color']
         self.trajectory_thickness = disp['trajectory_thickness']
         self.trajectory_color = disp['trajectory_color']
-        self.waypoint_radius = disp['waypoint_radius']
-        self.waypoint_color_pair = disp['waypoint_color_pair']
-        self.waypoint_color_virtual = disp['waypoint_color_virtual']
-        self.waypoint_color_stop = disp['waypoint_color_stop']
         self.pair_line_thickness = disp['pair_line_thickness']
         self.pair_line_color = disp['pair_line_color']
         

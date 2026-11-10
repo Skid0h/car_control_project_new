@@ -43,6 +43,12 @@ config = Config("config.jsonc")
 
 start()  # Запуск Web
 
+def draw_outlined_text(image, text, origin, scale, color, thickness):
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    cv2.putText(image, text, origin, font, scale, (0, 0, 0), thickness + 2, cv2.LINE_AA)
+    cv2.putText(image, text, origin, font, scale, color, thickness, cv2.LINE_AA)
+
+
 class VisionLoop:
     TARGET_TIMEOUT = 0.5
 
@@ -302,19 +308,18 @@ class VisionLoop:
         for det in detections:
             if self.config.draw_target_z and 'pos_3d' in det:
                 x1, y1, _, _ = det['bbox']
-                cv2.putText(image_np, f"Z_cam:{det['z_cam']:.2f}m", (x1, y1 - 25),
-                            cv2.FONT_HERSHEY_SIMPLEX, self.config.z_text_scale,
-                            self.config.z_text_color, self.config.z_text_thickness)
+                draw_outlined_text(image_np, f"Z_cam:{det['z_cam']:.2f}m", (x1, y1 - 25),
+                                   self.config.z_text_scale, self.config.z_text_color, self.config.z_text_thickness)
         if self.config.draw_trajectory:
             pts_2d = [[image_np.shape[1]//2, image_np.shape[0]]]
-            for wp in waypoints_3d:
+            for wp in sorted(waypoints_3d, key=lambda point: point['z']):
                 # Защита от деления на ноль: точки с z <= 0 не проецируем
                 if wp['z'] <= 0:
                     continue
                 x_cam = wp['x'] - self.config.camera_offset_x
                 z_cam = wp['z'] + self.config.camera_offset_z
                 u = int((x_cam * self.fx / z_cam) + self.cx_cam)
-                v = int(image_np.shape[0] * self.config.cone_base_v)
+                v = int(wp['image_v'])
                 pts_2d.append([u, v])
             if len(pts_2d) > 1:
                 pts_arr = np.array(pts_2d, np.int32).reshape((-1, 1, 2))
@@ -327,7 +332,8 @@ class VisionLoop:
             x_cam = target_x - self.config.camera_offset_x
             z_cam = target_z + self.config.camera_offset_z
             target_u = int((x_cam * self.fx / z_cam) + self.cx_cam)
-            target_v = int(image_np.shape[0] * self.config.cone_base_v)
+            target_v = int(next(wp['image_v'] for wp in waypoints_3d
+                                if wp['x'] == target_x and wp['z'] == target_z))
             cv2.drawMarker(image_np, (target_u, target_v), (0, 0, 255), 
                           cv2.MARKER_CROSS, 
                           self.config.target_cross_size, 
@@ -349,8 +355,7 @@ class VisionLoop:
                     color = (255, 255, 255)
                 
                 cv2.rectangle(image_np, (x1, y1), (x2, y2), color, 2)
-                cv2.putText(image_np, cone_name, (x1, y1-10), 
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+                draw_outlined_text(image_np, cone_name, (x1, y1 - 10), 0.5, color, 2)
 
         # ЛИНИИ МЕЖДУ ПАРАМИ 
         if self.config.pair_line_color:
@@ -572,18 +577,27 @@ class VisionLoop:
                             
                             mid_x = (b_x + y_x) / 2.0
                             mid_z = (b_z + y_z) / 2.0
-                            waypoints_3d.append({'x': mid_x, 'z': mid_z, 'type': 'pair', 'b_cone': b_cone, 'y_cone': y_cone})
+                            # Проекция середины пары по основаниям bbox с учётом глубины.
+                            image_v = (b_cone['bbox'][3] * b_cone['z_cam'] +
+                                       y_cone['bbox'][3] * y_cone['z_cam']) / (
+                                           b_cone['z_cam'] + y_cone['z_cam'])
+                            waypoints_3d.append({'x': mid_x, 'z': mid_z, 'image_v': image_v,
+                                                 'type': 'pair', 'b_cone': b_cone, 'y_cone': y_cone})
                             pairs_found_count += 1
 
                     if pairs_found_count == 0:
                         for b_cone in blue_cones:
                             b_x, b_z = b_cone['pos_3d']
-                            waypoints_3d.append({'x': b_x + self.config.virtual_point_offset, 'z': b_z, 'type': 'virtual_blue', 'steer_k': self.config.virtual_steer_k})
+                            waypoints_3d.append({'x': b_x + self.config.virtual_point_offset, 'z': b_z,
+                                                 'image_v': b_cone['bbox'][3], 'type': 'virtual_blue',
+                                                 'steer_k': self.config.virtual_steer_k})
                             
                         for i, y_cone in enumerate(yellow_cones):
                             if i not in used_yellows:
                                 y_x, y_z = y_cone['pos_3d']
-                                waypoints_3d.append({'x': y_x - self.config.virtual_point_offset, 'z': y_z, 'type': 'virtual_yellow', 'steer_k': self.config.virtual_steer_k})
+                                waypoints_3d.append({'x': y_x - self.config.virtual_point_offset, 'z': y_z,
+                                                     'image_v': y_cone['bbox'][3], 'type': 'virtual_yellow',
+                                                     'steer_k': self.config.virtual_steer_k})
 
                     waypoints_3d.sort(key=lambda wp: wp['z'])
 
@@ -591,7 +605,8 @@ class VisionLoop:
                     if orange_cones:
                         closest_orange = min(orange_cones, key=lambda c: c['pos_3d'][1])
                         o_x, o_z = closest_orange['pos_3d']
-                        waypoints_3d.append({'x': o_x, 'z': o_z, 'type': 'stop'})
+                        waypoints_3d.append({'x': o_x, 'z': o_z,
+                                             'image_v': closest_orange['bbox'][3], 'type': 'stop'})
                         distance_from_front = closest_orange['z_cam'] - self.config.camera_to_front_m
                         if distance_from_front < self.config.stop_cone_z_threshold:
                             target_detected = True
@@ -657,34 +672,34 @@ class VisionLoop:
                 rec_x = 10
                 if self.config.draw_fps:
                     processing_text = f"PROC {current_fps:.1f} / "
-                    cv2.putText(image_np, processing_text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX,
-                                self.config.fps_text_scale, (0, 255, 0), self.config.fps_text_thickness)
+                    draw_outlined_text(image_np, processing_text, (10, 30),
+                                       self.config.fps_text_scale, (0, 255, 0), self.config.fps_text_thickness)
                     (text_width, _), _ = cv2.getTextSize(processing_text, cv2.FONT_HERSHEY_SIMPLEX,
                                                        self.config.fps_text_scale, self.config.fps_text_thickness)
-                    cv2.putText(image_np, f"STREAM {current_stream_fps:.1f}", (10 + text_width, 30),
-                                cv2.FONT_HERSHEY_SIMPLEX, self.config.fps_text_scale,
-                                (0, 0, 255), self.config.fps_text_thickness)
+                    draw_outlined_text(image_np, f"STREAM {current_stream_fps:.1f}", (10 + text_width, 30),
+                                       self.config.fps_text_scale, (0, 0, 255), self.config.fps_text_thickness)
                     mode_text = 'AUTO' if self.robot_state['auto_mode'] else 'MANUAL'
-                    cv2.putText(image_np, mode_text, (10, 55), cv2.FONT_HERSHEY_SIMPLEX,
-                                self.config.fps_text_scale, self.config.fps_text_color, self.config.fps_text_thickness)
+                    draw_outlined_text(image_np, mode_text, (10, 55),
+                                       self.config.fps_text_scale, self.config.fps_text_color, self.config.fps_text_thickness)
                     (mode_width, _), _ = cv2.getTextSize(mode_text, cv2.FONT_HERSHEY_SIMPLEX,
                                                        self.config.fps_text_scale, self.config.fps_text_thickness)
                     rec_x += mode_width + 12
                 if self.config.draw_target_z:
                     display_target_z = target_z if target_z is not None else 0.0
-                    cv2.putText(image_np, f"Target Z: {display_target_z:.2f}m", (10, 115), cv2.FONT_HERSHEY_SIMPLEX,
-                               self.config.target_z_text_scale, self.config.target_z_text_color, self.config.target_z_text_thickness)
+                    draw_outlined_text(image_np, f"Target Z: {display_target_z:.2f}m", (10, 115),
+                                       self.config.target_z_text_scale, self.config.target_z_text_color,
+                                       self.config.target_z_text_thickness)
                 
                 if self.config.draw_speed and self.car is not None:
                     speed_text = f'Speed: {self.car.get_speed():.2f} km/h'
-                    cv2.putText(image_np, speed_text, (10, 85), cv2.FONT_HERSHEY_SIMPLEX,
-                               self.config.speed_text_scale, self.config.speed_text_color, self.config.speed_text_thickness)
+                    draw_outlined_text(image_np, speed_text, (10, 85),
+                                       self.config.speed_text_scale, self.config.speed_text_color, self.config.speed_text_thickness)
                 
                 # ЗАПИСЬ
                 if self.is_recording:
                     if self.config.draw_rec:
-                        cv2.putText(image_np, "REC", (rec_x, 55), cv2.FONT_HERSHEY_SIMPLEX,
-                                   self.config.rec_text_scale, self.config.rec_text_color, self.config.rec_text_thickness)
+                        draw_outlined_text(image_np, "REC", (rec_x, 55),
+                                           self.config.rec_text_scale, self.config.rec_text_color, self.config.rec_text_thickness)
                     if not was_recording:
                         rec_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
                         was_recording = True

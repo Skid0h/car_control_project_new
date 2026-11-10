@@ -6,10 +6,18 @@
 import os
 import sys
 import json
+import math
 import re
 
 
 class Config:
+    def cone_distance_from_area(self, area, cone_name):
+        """Расстояние от камеры, м; калибровка по площади bbox в исходном кадре."""
+        calibration = self.area_depth_calibration.get(cone_name)
+        if calibration is None:
+            return self.area_depth_constant / math.sqrt(area)
+        return calibration['scale'] / math.sqrt(area) + calibration['offset']
+
     def __init__(self, config_path="config.jsonc"):
         if not os.path.exists(config_path):
             print(f"Файл конфигурации '{config_path}' не найден.")
@@ -64,6 +72,7 @@ class Config:
         self.virtual_steer_k = ap['virtual_steer_k']
         self.stop_cone_z_threshold = ap['stop_cone_z_threshold']
         self.area_depth_constant = ap['area_depth_constant']
+        self.area_depth_calibration = ap.get('area_depth_calibration', {})
         self.graceful_degradation_speed = ap['graceful_degradation_speed']
         
         # Vision
@@ -80,6 +89,7 @@ class Config:
         self.output_folder = vis['output_folder']
         self.camera_offset_x = vis['camera_offset_x']
         self.camera_offset_z = vis['camera_offset_z']
+        self.camera_to_front_m = vis.get('camera_to_front_m', self.camera_offset_z)
         self.zed_resolution = vis['zed_resolution']
         self.depth_mode = vis['depth_mode']
         self.coordinate_units = vis['coordinate_units']

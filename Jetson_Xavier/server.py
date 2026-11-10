@@ -302,7 +302,7 @@ class VisionLoop:
         for det in detections:
             if self.config.draw_target_z and 'pos_3d' in det:
                 x1, y1, _, _ = det['bbox']
-                cv2.putText(image_np, f"Z:{det['pos_3d'][1]:.1f}m", (x1, y1 - 25),
+                cv2.putText(image_np, f"Z_cam:{det['z_cam']:.2f}m", (x1, y1 - 25),
                             cv2.FONT_HERSHEY_SIMPLEX, self.config.z_text_scale,
                             self.config.z_text_color, self.config.z_text_thickness)
         if self.config.draw_trajectory:
@@ -311,7 +311,9 @@ class VisionLoop:
                 # Защита от деления на ноль: точки с z <= 0 не проецируем
                 if wp['z'] <= 0:
                     continue
-                u = int((wp['x'] * self.fx / wp['z']) + self.cx_cam)
+                x_cam = wp['x'] - self.config.camera_offset_x
+                z_cam = wp['z'] + self.config.camera_offset_z
+                u = int((x_cam * self.fx / z_cam) + self.cx_cam)
                 v = int(image_np.shape[0] * self.config.cone_base_v)
                 pts_2d.append([u, v])
             if len(pts_2d) > 1:
@@ -322,7 +324,9 @@ class VisionLoop:
 
         # Отрисовка цели только если z корректен для проекции
         if self.config.draw_target and target_z is not None and target_z > 0:
-            target_u = int((target_x * self.fx / target_z) + self.cx_cam)
+            x_cam = target_x - self.config.camera_offset_x
+            z_cam = target_z + self.config.camera_offset_z
+            target_u = int((x_cam * self.fx / z_cam) + self.cx_cam)
             target_v = int(image_np.shape[0] * self.config.cone_base_v)
             cv2.drawMarker(image_np, (target_u, target_v), (0, 0, 255), 
                           cv2.MARKER_CROSS, 
@@ -517,15 +521,16 @@ class VisionLoop:
                         height = max(y2 - y1, 1)
                         area = width * height
                         
-                        z = self.config.area_depth_constant / math.sqrt(area)
+                        cone_name = det.get('name', '')
+                        z = self.config.cone_distance_from_area(area, cone_name)
                         
                         if self.config.min_depth < z <= self.config.max_depth:
+                            det['z_cam'] = z
                             u, v = det['center']
                             x_cam = (u - self.cx_cam) * z / self.fx
-                            # Учитываем смещение камеры относительно центра машины по X
-                            det['pos_3d'] = (x_cam - self.config.camera_offset_x, z - self.config.camera_offset_z)
+                            # Переводим координаты левого объектива в систему машинки.
+                            det['pos_3d'] = (x_cam + self.config.camera_offset_x, z - self.config.camera_offset_z)
                             
-                            cone_name = det.get('name', '')
                             if cone_name in self.config.blue_cones:
                                 blue_cones.append(det)
                             elif cone_name in self.config.yellow_cones:
@@ -587,7 +592,8 @@ class VisionLoop:
                         closest_orange = min(orange_cones, key=lambda c: c['pos_3d'][1])
                         o_x, o_z = closest_orange['pos_3d']
                         waypoints_3d.append({'x': o_x, 'z': o_z, 'type': 'stop'})
-                        if o_z < self.config.stop_cone_z_threshold: 
+                        distance_from_front = closest_orange['z_cam'] - self.config.camera_to_front_m
+                        if distance_from_front < self.config.stop_cone_z_threshold:
                             target_detected = True
 
                     target_x, target_z = None, None
@@ -648,6 +654,7 @@ class VisionLoop:
                 publish_phase -= self.config.zed_fps
                 self._draw_overlay(image_np, detections, waypoints_3d, target_x, target_z)
                 
+                rec_x = 10
                 if self.config.draw_fps:
                     processing_text = f"PROC {current_fps:.1f} / "
                     cv2.putText(image_np, processing_text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX,
@@ -657,22 +664,26 @@ class VisionLoop:
                     cv2.putText(image_np, f"STREAM {current_stream_fps:.1f}", (10 + text_width, 30),
                                 cv2.FONT_HERSHEY_SIMPLEX, self.config.fps_text_scale,
                                 (0, 0, 255), self.config.fps_text_thickness)
-                    cv2.putText(image_np, 'AUTO' if self.robot_state['auto_mode'] else 'MANUAL',
-                                (image_np.shape[1] - 150, 30), cv2.FONT_HERSHEY_SIMPLEX,
+                    mode_text = 'AUTO' if self.robot_state['auto_mode'] else 'MANUAL'
+                    cv2.putText(image_np, mode_text, (10, 55), cv2.FONT_HERSHEY_SIMPLEX,
                                 self.config.fps_text_scale, self.config.fps_text_color, self.config.fps_text_thickness)
-                if target_x is not None and self.config.draw_target_z:
-                    cv2.putText(image_np, f"Target Z: {target_z:.2f}m", (10, 115), cv2.FONT_HERSHEY_SIMPLEX, 
+                    (mode_width, _), _ = cv2.getTextSize(mode_text, cv2.FONT_HERSHEY_SIMPLEX,
+                                                       self.config.fps_text_scale, self.config.fps_text_thickness)
+                    rec_x += mode_width + 12
+                if self.config.draw_target_z:
+                    display_target_z = target_z if target_z is not None else 0.0
+                    cv2.putText(image_np, f"Target Z: {display_target_z:.2f}m", (10, 115), cv2.FONT_HERSHEY_SIMPLEX,
                                self.config.target_z_text_scale, self.config.target_z_text_color, self.config.target_z_text_thickness)
                 
-                # Скорость с датчика Arduino (чуть ниже FPS/Target Z)
                 if self.config.draw_speed and self.car is not None:
-                    cv2.putText(image_np, f"Speed: {self.car.get_speed() * 3.6:.2f} km/h", (10, 85), cv2.FONT_HERSHEY_SIMPLEX,
+                    speed_text = f'Speed: {self.car.get_speed():.2f} km/h'
+                    cv2.putText(image_np, speed_text, (10, 85), cv2.FONT_HERSHEY_SIMPLEX,
                                self.config.speed_text_scale, self.config.speed_text_color, self.config.speed_text_thickness)
                 
                 # ЗАПИСЬ
                 if self.is_recording:
                     if self.config.draw_rec:
-                        cv2.putText(image_np, "REC", (10, 55), cv2.FONT_HERSHEY_SIMPLEX,
+                        cv2.putText(image_np, "REC", (rec_x, 55), cv2.FONT_HERSHEY_SIMPLEX,
                                    self.config.rec_text_scale, self.config.rec_text_color, self.config.rec_text_thickness)
                     if not was_recording:
                         rec_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")

@@ -28,7 +28,7 @@ class CarController:
         self.last_command_time = 0                                      # Для watchdog
         self.last_sent_cmd     = ""                                     # Последняя отправленная строка команды
         self.arduino = None
-        self.current_speed   = 0.0                                      # Текущая скорость с датчика (м/с)
+        self.current_speed   = 0.0                                      # Показание скорости от Arduino
         self._speed_sample = (0.0, 0.0)
         self._reader_thread  = None                                     # Поток чтения скорости из UART
 
@@ -78,7 +78,7 @@ class CarController:
                     self._speed_sample = (speed, time.monotonic())
 
     def get_speed(self):
-        """Текущая скорость машины по датчику, м/с"""
+        """Показание скорости от Arduino без пересчёта."""
         speed, received_at = self._speed_sample
         if self.arduino is None or time.monotonic() - received_at >= 0.5:
             return 0.0

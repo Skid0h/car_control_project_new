@@ -13,9 +13,9 @@ const int SPEED_SENSOR_PIN = A0;      // Датчик скорости (анал
 const long SERIAL_BAUD = 9600;        // Скорость UART
 
 // ESC
-const int ESC_MIN = 1400;             // Максимальный реверс
+const int ESC_MIN = 1380;             // Максимальный реверс
 const int ESC_NEUTRAL = 1500;         // Нейтраль
-const int ESC_MAX = 1600;             // Максимальный газ
+const int ESC_MAX = 1620;             // Максимальный газ
 const int ESC_REVERSE_DELAY = 150;    // Пауза при смене направления, мс
 
 // Failsafe
@@ -24,7 +24,7 @@ const unsigned long FAILSAFE_TIMEOUT = 500;  // Потеря связи, мс
 // Руль
 const int STEERING_MIN = 0;            // Минимальный угол
 const int STEERING_MAX = 180;          // Максимальный угол
-const int STEERING_CENTER = 90;        // Центральное положение
+const int STEERING_CENTER = 92;        // Центральное положение
 const int STEERING_STEP = 3;           // Минимальный физический шаг, градусы
 const unsigned long STEERING_INTERVAL = 20; // Интервал движения, мс
 

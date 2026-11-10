@@ -20,11 +20,14 @@
   "auto_speed": {
     "target_kmh": 3.0,
     "start_pwm": 1572,
+    "ramp_pwm": 1576,           // Верхняя граница стартового разгона
+    "ramp_interval_s": 0.3,     // Пауза между шагами разгона
+    "settle_time_s": 1.0,       // Пауза перед удержанием после достижения ramp_pwm
     "min_pwm": 1570,
     "max_pwm": 1580,
     "step_pwm": 1,
     "increase_interval_s": 0.5,
-    "decrease_interval_s": 0.1,
+    "decrease_interval_s": 0.5,
     "deadband_kmh": 0.1,       // Допуск вокруг заданной скорости
     "startup_timeout_s": 2.0,  // Ожидание первого свежего показания после старта
     "sensor_timeout_s": 0.75   // Максимальный возраст показания скорости
@@ -90,10 +93,14 @@
     "virtual_point_offset"       : 0.7,    // Смещение виртуальных точек от одиночных конусов
     "virtual_steer_k"            : 2.5,    // Множитель руля для одиночных конусов (2.0 = нормальный, больше = резче)
     "stop_cone_z_threshold"      : 0.8,    // Порог расстояния до стоп-конуса для остановки (метры)
-    "area_depth_calibration": { // Z_cam = scale / sqrt(area) + offset; замеры на 1–3 м и уточнение по стриму
-      "yellow": {"scale": 144.24537901, "offset": -0.29238639},
-      "blue": {"scale": 117.17568055506028, "offset": -0.11525061064212672},
-      "orange": {"scale": 158.6400534399064, "offset": -0.10241952}
+    "area_depth_calibration": { // Базовый Z_cam = scale / sqrt(area) + offset
+      // distance_correction: пары [базовый Z_cam, расстояние по рулетке], м
+      "yellow": {"scale": 144.24537901, "offset": -0.29238639,
+                 "distance_correction": [[1.0, 1.0], [2.35, 2.0], [3.20, 3.0]]},
+      "blue": {"scale": 117.17568055506028, "offset": -0.11525061064212672,
+               "distance_correction": [[2.0, 2.0], [2.84, 3.0]]},
+      "orange": {"scale": 158.6400534399064, "offset": -0.10241952,
+                 "distance_correction": [[2.0, 2.0], [2.79, 3.0]]}
     },
     "graceful_degradation_speed" : 0.3     // Устаревший параметр. Через 0,5 с без свежей цели газ переводится в нейтраль.
   },

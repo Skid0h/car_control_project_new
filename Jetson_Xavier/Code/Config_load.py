@@ -20,7 +20,18 @@ class Config:
         calibration = self.area_depth_calibration.get(cone_name)
         if calibration is None:
             return self.area_depth_constant / math.sqrt(area)
-        return calibration['scale'] / math.sqrt(area) + calibration['offset']
+        z = calibration['scale'] / math.sqrt(area) + calibration['offset']
+        anchors = calibration.get('distance_correction', [])
+        if not anchors or z <= anchors[0][0]:
+            return z
+
+        # Между контрольными замерами плавно меняем поправку.
+        for (near_z, near_true), (far_z, far_true) in zip(anchors, anchors[1:]):
+            if z <= far_z:
+                weight = (z - near_z) / (far_z - near_z)
+                return near_true + weight * (far_true - near_true)
+        last_z, last_true = anchors[-1]
+        return z + (last_true - last_z)
 
     def __init__(self, config_path="config.jsonc"):
         if not os.path.exists(config_path):
@@ -54,20 +65,26 @@ class Config:
         self.esc_max = car['esc_max']
         self.auto_speed = cfg['auto_speed']
         speed = self.auto_speed
+        speed.setdefault('ramp_pwm', speed['start_pwm'])
+        speed.setdefault('ramp_interval_s', 0.3)
+        speed.setdefault('settle_time_s', 0.0)
         for key, value in speed.items():
             if type(value) not in (int, float) or not math.isfinite(value):
                 raise ValueError(f'auto_speed.{key} должно быть конечным числом')
-        if not self.neutral_speed < speed['min_pwm'] <= speed['start_pwm'] <= speed['max_pwm'] <= self.esc_max:
+        if not (self.neutral_speed < speed['min_pwm'] <= speed['start_pwm'] <=
+                speed['ramp_pwm'] <= speed['max_pwm'] <= self.esc_max):
             raise ValueError('Некорректные границы ШИМ auto_speed')
-        for key in ('min_pwm', 'start_pwm', 'max_pwm', 'step_pwm'):
+        for key in ('min_pwm', 'start_pwm', 'ramp_pwm', 'max_pwm', 'step_pwm'):
             if type(speed[key]) is not int:
                 raise ValueError(f'auto_speed.{key} должно быть целым числом')
         for key in ('target_kmh', 'step_pwm', 'increase_interval_s', 'decrease_interval_s',
-                    'startup_timeout_s', 'sensor_timeout_s'):
+                    'startup_timeout_s', 'sensor_timeout_s', 'ramp_interval_s'):
             if speed[key] <= 0:
                 raise ValueError(f'auto_speed.{key} должно быть положительным')
         if not 0 <= speed['deadband_kmh'] < speed['target_kmh']:
             raise ValueError('Некорректный допуск скорости')
+        if speed['settle_time_s'] < 0:
+            raise ValueError('auto_speed.settle_time_s не может быть отрицательным')
         
         # PID
         pid = cfg['pid']

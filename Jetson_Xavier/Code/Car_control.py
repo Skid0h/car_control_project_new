@@ -83,6 +83,9 @@ class CarController:
         if self.arduino is None or time.monotonic() - received_at >= 0.5:
             return 0.0
         return speed
+
+    def get_speed_sample(self):
+        return self._speed_sample if self.arduino is not None else (0.0, 0.0)
    
     def set_speeds(self, forward, back):
         self.config.forward_speed = forward
@@ -96,7 +99,12 @@ class CarController:
             motor_value = int(self.config.neutral_speed + (self.config.forward_speed - self.config.neutral_speed) * speed_clamped)
         elif speed_clamped < 0: 
             motor_value = int(self.config.neutral_speed + (self.config.back_speed - self.config.neutral_speed) * abs(speed_clamped))
-        # Ограничиваем motor_value в безопасные пределы ESC (1000-2000 мкс)
+        self.update_pwm(motor_value, steering)
+
+    def update_pwm(self, motor_value, steering):
+        if not self.arduino:
+            return
+        motor_value = int(motor_value)
         motor_value = max(self.config.esc_min, min(self.config.esc_max, motor_value))
        
         steering_clamped = max(-1.0, min(1.0, float(steering)))

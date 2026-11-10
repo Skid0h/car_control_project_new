@@ -52,6 +52,22 @@ class Config:
         self.steering_range = car['steering_range']
         self.esc_min = car['esc_min']
         self.esc_max = car['esc_max']
+        self.auto_speed = cfg['auto_speed']
+        speed = self.auto_speed
+        for key, value in speed.items():
+            if type(value) not in (int, float) or not math.isfinite(value):
+                raise ValueError(f'auto_speed.{key} должно быть конечным числом')
+        if not self.neutral_speed < speed['min_pwm'] <= speed['start_pwm'] <= speed['max_pwm'] <= self.esc_max:
+            raise ValueError('Некорректные границы ШИМ auto_speed')
+        for key in ('min_pwm', 'start_pwm', 'max_pwm', 'step_pwm'):
+            if type(speed[key]) is not int:
+                raise ValueError(f'auto_speed.{key} должно быть целым числом')
+        for key in ('target_kmh', 'step_pwm', 'increase_interval_s', 'decrease_interval_s',
+                    'startup_timeout_s', 'sensor_timeout_s'):
+            if speed[key] <= 0:
+                raise ValueError(f'auto_speed.{key} должно быть положительным')
+        if not 0 <= speed['deadband_kmh'] < speed['target_kmh']:
+            raise ValueError('Некорректный допуск скорости')
         
         # PID
         pid = cfg['pid']

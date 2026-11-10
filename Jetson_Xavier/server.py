@@ -33,6 +33,7 @@ except:
 
 from Code.Config_load import Config
 from Code.Car_control import CarController
+from Code.Speed_control import SpeedController
 from Code.Cone_detector import ConeDetector
 from Code.Web import start, set_frame
 
@@ -92,12 +93,14 @@ class VisionLoop:
         self.detect_thread = threading.Thread(target=self._detect_loop, daemon=True)
         self.detect_thread.start()
 
+        self.speed_controller = SpeedController(config.auto_speed)
         self._reset_pid()
 
         self.vision_thread = threading.Thread(target=self._vision_loop, daemon=True)
         self.vision_thread.start()
 
     def _reset_pid(self):
+        self.speed_controller.reset()
         self.pid_integral = 0.0
         self.pid_prev_error = 0.0
         self.pid_prev_time = None
@@ -285,12 +288,7 @@ class VisionLoop:
         return output
 
     def _select_lookahead_target(self, waypoints_3d, lookahead):
-        """Pure Pursuit: выбор точки траектории на дистанции упреждения.
-
-        Берём самую дальнюю точку, которая ещё не дальше lookahead_distance.
-        Это устраняет дёрганье при близкой цели и запаздывание при дальней.
-        Список сортирован по z (возрастание), поэтому идём от ближайшей к дальней.
-        """
+        """Интерполяция цели по продольной дистанции между точками пути."""
         if not waypoints_3d:
             return None
         
@@ -302,13 +300,24 @@ class VisionLoop:
         else:
             adjusted_lookahead = lookahead
         
-        target = waypoints_3d[0]
-        for wp in waypoints_3d:
-            if wp['z'] <= adjusted_lookahead:
-                target = wp
-            else:
-                break
-        return target
+        if adjusted_lookahead <= waypoints_3d[0]['z']:
+            return waypoints_3d[0]
+        for near, far in zip(waypoints_3d, waypoints_3d[1:]):
+            if near['z'] < adjusted_lookahead <= far['z']:
+                weight = (adjusted_lookahead - near['z']) / (far['z'] - near['z'])
+                near_z_cam = near['z'] + self.config.camera_offset_z
+                far_z_cam = far['z'] + self.config.camera_offset_z
+                target_z_cam = adjusted_lookahead + self.config.camera_offset_z
+                # Интерполируем высоту в пространстве и проецируем обратно в кадр.
+                image_v = ((1 - weight) * near['image_v'] * near_z_cam +
+                           weight * far['image_v'] * far_z_cam) / target_z_cam
+                return {
+                    'x': near['x'] + weight * (far['x'] - near['x']),
+                    'z': adjusted_lookahead,
+                    'image_v': image_v,
+                    'steer_k': min(near.get('steer_k', 2.0), far.get('steer_k', 2.0)),
+                }
+        return waypoints_3d[-1]
 
     def _draw_overlay(self, image_np, detections, waypoints_3d, target_x, target_z):
         for det in detections:
@@ -338,8 +347,8 @@ class VisionLoop:
             x_cam = target_x - self.config.camera_offset_x
             z_cam = target_z + self.config.camera_offset_z
             target_u = int((x_cam * self.fx / z_cam) + self.cx_cam)
-            target_v = int(next(wp['image_v'] for wp in waypoints_3d
-                                if wp['x'] == target_x and wp['z'] == target_z))
+            target_wp = self._select_lookahead_target(waypoints_3d, self.config.lookahead_distance)
+            target_v = int(target_wp['image_v'])
             cv2.drawMarker(image_np, (target_u, target_v), (0, 0, 255), 
                           cv2.MARKER_CROSS, 
                           self.config.target_cross_size, 
@@ -610,10 +619,12 @@ class VisionLoop:
                     target_detected = False
                     if orange_cones:
                         closest_orange = min(orange_cones, key=lambda c: c['pos_3d'][1])
-                        o_x, o_z = closest_orange['pos_3d']
-                        waypoints_3d.append({'x': o_x, 'z': o_z,
-                                             'image_v': closest_orange['bbox'][3], 'type': 'stop'})
                         distance_from_front = closest_orange['z_cam'] - self.config.camera_to_front_m
+                        if distance_from_front < 2.0:
+                            # На финишном участке ориентируемся только на стоп-конус.
+                            o_x, o_z = closest_orange['pos_3d']
+                            waypoints_3d = [{'x': o_x, 'z': o_z,
+                                             'image_v': closest_orange['bbox'][3], 'type': 'stop'}]
                         if distance_from_front < self.config.stop_cone_z_threshold:
                             target_detected = True
 
@@ -644,7 +655,19 @@ class VisionLoop:
                                 steer_k = target_wp.get('steer_k', 2.0)
                                 steering = self._pid_steering(error, steer_k, detected_at)
                                 self.last_steering = steering
-                                self.car.update(1.0, steering)
+                                try:
+                                    speed, sampled_at = self.car.get_speed_sample()
+                                    pwm = self.speed_controller.update(time.monotonic(), speed, sampled_at)
+                                    self.car.update_pwm(pwm, steering)
+                                except TimeoutError as exc:
+                                    self.car.stop()
+                                    self._reset_pid()
+                                    self.robot_state['auto_mode'] = False
+                                    self.robot_state['msg'] = str(exc)
+                                    self.robot_state['msg_time'] = time.time()
+                            else:
+                                self.car.update(0.0, self.last_steering)
+                                self._reset_pid()
 
                     self.last_detections = detections
                     self.last_waypoints_3d = waypoints_3d
@@ -702,6 +725,14 @@ class VisionLoop:
                                        self.config.speed_text_scale, self.config.speed_text_color, self.config.speed_text_thickness)
                 
                 # ЗАПИСЬ
+                if self.robot_state['auto_mode']:
+                    pwm = self.speed_controller.pwm
+                    if pwm is None:
+                        pwm = self.config.neutral_speed
+                    draw_outlined_text(image_np, f"AUTO PWM: {pwm}", (10, 145),
+                                       self.config.speed_text_scale, self.config.speed_text_color,
+                                       self.config.speed_text_thickness)
+
                 if self.is_recording:
                     if self.config.draw_rec:
                         draw_outlined_text(image_np, "REC", (rec_x, 55),

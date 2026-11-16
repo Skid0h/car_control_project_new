@@ -111,7 +111,10 @@ class VisionLoop:
 
     def enable_auto(self):
         with self.control_lock:
-            if not self.robot_state['cam_connected']:
+            if self.robot_state['autopilot_mode'] == 'RACE':
+                self.robot_state['msg'] = 'ЗАПУСК RACE ПОКА НЕ РЕАЛИЗОВАН'
+                self.robot_state['msg_time'] = time.time()
+            elif not self.robot_state['cam_connected']:
                 self.robot_state['msg'] = 'АВТОРЕЖИМ НЕДОСТУПЕН: НЕТ КАДРОВ С КАМЕРЫ'
                 self.robot_state['msg_time'] = time.time()
             elif not self.robot_state['auto_mode']:
@@ -121,6 +124,41 @@ class VisionLoop:
                 self.last_steering = 0.0
                 self.robot_state['auto_mode'] = True
                 self.robot_state['msg'] = ''
+
+    def apply_autopilot_setting(self, command):
+        if command.startswith('mode:'):
+            profile = command[5:]
+            if profile not in ('PWM', 'MANUAL', 'RACE'):
+                raise ValueError('Неизвестный профиль автопилота')
+            with self.control_lock:
+                if profile != self.robot_state['autopilot_mode']:
+                    self.robot_state['auto_mode'] = False
+                    self.car.stop()
+                    self._reset_pid()
+                    self.robot_state['autopilot_mode'] = profile
+                self.robot_state['msg'] = ''
+            return
+        target = float(command)
+        if not math.isfinite(target) or not 0 <= target <= 10:
+            raise ValueError('Целевая скорость должна быть от 0 до 10 км/ч')
+        with self.control_lock:
+            self.config.auto_speed['target_kmh'] = target
+            self.robot_state['target_speed_kmh'] = target
+            if target == 0 and self.robot_state['autopilot_mode'] == 'MANUAL':
+                self.speed_controller.reset()
+                if self.robot_state['auto_mode']:
+                    self.car.stop()
+            self.robot_state['msg'] = ''
+
+    def _autopilot_pwm(self):
+        profile = self.robot_state['autopilot_mode']
+        if profile == 'PWM':
+            self.speed_controller.pwm = self.config.forward_speed
+            return self.config.forward_speed
+        if profile == 'MANUAL' and self.robot_state['target_speed_kmh'] > 0:
+            speed, sampled_at = self.car.get_speed_sample()
+            return self.speed_controller.update(time.monotonic(), speed, sampled_at)
+        return self.config.neutral_speed
 
     def _camera_lost(self):
         with self.control_lock:
@@ -676,8 +714,7 @@ class VisionLoop:
                                 steering = self._pid_steering(error, steer_k, detected_at)
                                 self.last_steering = steering
                                 try:
-                                    speed, sampled_at = self.car.get_speed_sample()
-                                    pwm = self.speed_controller.update(time.monotonic(), speed, sampled_at)
+                                    pwm = self._autopilot_pwm()
                                     self.car.update_pwm(pwm, steering)
                                 except TimeoutError as exc:
                                     self.car.stop()
@@ -864,7 +901,9 @@ def main():
     
     detector = ConeDetector(config)
     car = CarController(config)
-    robot_state = {'auto_mode': False, 'cam_connected': False, 'arduino_connected': False, 'msg': '', 'msg_time': 0}
+    robot_state = {'auto_mode': False, 'autopilot_mode': 'PWM',
+                   'target_speed_kmh': config.auto_speed['target_kmh'],
+                   'cam_connected': False, 'arduino_connected': False, 'msg': '', 'msg_time': 0}
     robot_state['arduino_connected'] = car.arduino is not None
     loop = VisionLoop(config, detector, car, robot_state)
     running = True
@@ -876,7 +915,10 @@ def main():
             try:
                 data, addr = sock.recvfrom(1024)
                 last_addr = addr
-                command = data.decode('utf-8').strip()
+                try:
+                    command = data.decode('utf-8').strip()
+                except UnicodeDecodeError:
+                    continue
                 if command == "Q":
                     running = False
                     break
@@ -884,9 +926,9 @@ def main():
                     loop.enable_auto()
                 elif command == "S":
                     with loop.control_lock:
-                        if robot_state['auto_mode']:
-                            robot_state['auto_mode'] = False
-                            car.stop()
+                        robot_state['auto_mode'] = False
+                        car.stop()
+                        loop._reset_pid()
                 elif command == "R":
                     loop.is_recording = True
                 elif command == "C":
@@ -931,12 +973,23 @@ def main():
                         # Контроль диапазона ШИМ (защита от опечаток клиента)
                         if not (config.esc_min <= fwd <= config.esc_max and config.esc_min <= bck <= config.esc_max):
                             raise ValueError(f"ШИМ вне диапазона [{config.esc_min}, {config.esc_max}]")
-                        car.set_speeds(fwd, bck)
+                        with loop.control_lock:
+                            car.set_speeds(fwd, bck)
                     except (ValueError, TypeError) as e:
                         logger.warning(f"Некорректная команда speed: {command!r} ({e})")
+                elif command == 'telemetry':
+                    pass
+                elif command.startswith('mode:') or ',' not in command:
+                    try:
+                        loop.apply_autopilot_setting(command)
+                    except ValueError as exc:
+                        robot_state['msg'] = str(exc)
+                        robot_state['msg_time'] = time.time()
                 else:
                     try:
                         speed, steering = map(float, command.split(','))
+                        if not all(math.isfinite(v) and -1 <= v <= 1 for v in (speed, steering)):
+                            raise ValueError('Некорректная команда движения')
                         with loop.control_lock:
                             if robot_state['auto_mode'] and (speed != 0.0 or steering != 0.0):
                                 robot_state['auto_mode'] = False
@@ -954,6 +1007,8 @@ def main():
 
                 telemetry = {
                     "mode": "AUTO" if robot_state['auto_mode'] else "MANUAL",
+                    "autopilot_mode": robot_state['autopilot_mode'],
+                    "target_speed_kmh": robot_state['target_speed_kmh'],
                     "rec": loop.is_recording,
                     "cam_connected": robot_state['cam_connected'],
                     "arduino_connected": robot_state['arduino_connected'],

@@ -34,7 +34,7 @@ except:
 from Code.Config_load import Config
 from Code.Car_control import CarController
 from Code.Speed_control import SpeedController
-from Code.Race_track import build_race_track
+from Code.Track_geometry import build_track_geometry
 from Code.Cone_detector import ConeDetector
 from Code.Web import start, set_frame
 
@@ -73,8 +73,7 @@ class VisionLoop:
         self.process_every = 1
         self.last_detection_at = 0.0
         self.last_detections = []
-        self.last_waypoints_3d = []
-        self.last_race_track = None
+        self.last_track_geometry = None
         self.smoothed_target = None
         self.smoothed_target_at = 0.0
         self.last_target_z = None
@@ -113,7 +112,10 @@ class VisionLoop:
 
     def enable_auto(self):
         with self.control_lock:
-            if not self.robot_state['cam_connected']:
+            if self.robot_state['autopilot_mode'] == 'RACE':
+                self.robot_state['msg'] = 'RACE is not available yet'
+                self.robot_state['msg_time'] = time.time()
+            elif not self.robot_state['cam_connected']:
                 self.robot_state['msg'] = 'АВТОРЕЖИМ НЕДОСТУПЕН: НЕТ КАДРОВ С КАМЕРЫ'
                 self.robot_state['msg_time'] = time.time()
             elif not self.robot_state['auto_mode']:
@@ -174,8 +176,6 @@ class VisionLoop:
                     time.monotonic() - self.last_target_at >= self.TARGET_TIMEOUT):
                 if self.pid_prev_time is not None:
                     self._reset_pid()
-                if self.robot_state['autopilot_mode'] == 'RACE':
-                    self.speed_controller.pwm = self.config.neutral_speed
                 self.car.update(0.0, self.last_steering)
 
     def _detect_loop(self):
@@ -340,43 +340,38 @@ class VisionLoop:
         change = max(-max_step, min(max_step, desired - self.last_steering))
         return self.last_steering + change
 
-    def _drive_race(self, track, detected_at):
-        neutral = self.config.neutral_speed
-        if track is None or track.target is None:
-            self.speed_controller.pwm = neutral
-            self.car.update_pwm(neutral, self.last_steering)
-            return
-        self.last_target_at = detected_at
-        x, z = track.target
-        curvature = 2 * x / (x*x + z*z)
-        desired = float(np.clip(curvature * self.config.race['min_turn_radius_m'], -1., 1.))
-        self.last_steering = self._limit_steering_change(desired)
-        max_pwm = max(neutral, min(self.config.forward_speed, self.config.esc_max))
-        pwm = neutral + round(track.throttle * (max_pwm - neutral))
-        self.speed_controller.pwm = pwm
-        self.car.update_pwm(pwm, self.last_steering)
-
-    def _draw_race_track(self, image, track):
-        height, width = image.shape[:2]
-        size = min(360, height * 2 // 3, width // 3)
-        if size < 125:
-            return
-        panel = image[10:10 + size, width - size - 10:width - 10]
-        panel[:] = (24, 24, 24)
+    def _draw_track_geometry(self, image, track, detections):
         if track is None:
             return
-        points = np.vstack(([0., 0.], track.blue, track.yellow))
-        lower, upper = points.min(axis=0), points.max(axis=0)
-        scale = (size - 60) / max(*(upper - lower), 1.)
-        mid = (lower + upper) / 2
+        bases = {tuple(det['pos_3d']): (det['center'][0], det['bbox'][3])
+                 for det in detections if 'pos_3d' in det}
+        floor_samples = []
+        for line, color in ((track.blue, (255, 125, 40)), (track.yellow, (0, 225, 255))):
+            pixels = []
+            for x, z in line:
+                base = bases.get((x, z))
+                if base is not None:
+                    pixels.append(base)
+                    floor_samples.append((1 / (z + self.config.camera_offset_z), base[1]))
+            if len(pixels) >= 2:
+                cv2.polylines(image, [np.rint(pixels).astype(np.int32)],
+                              False, color, 3, cv2.LINE_AA)
 
-        def pixels(line):
-            return np.rint((line - mid) * [scale, -scale] + [size / 2, size / 2 + 9]).astype(np.int32)
+        if track.center is None or len(floor_samples) < 2:
+            return
 
-        for line, color in ((track.blue, (255, 125, 40)), (track.yellow, (0, 225, 255)),
-                            (track.center, (65, 235, 80))):
-            if line is not None and len(line) >= 2:
-                cv2.polylines(panel, [pixels(line)], False, color, 3, cv2.LINE_AA)
+        # Для плоской трассы высота на кадре линейна по обратной глубине.
+        # Восстанавливаем её по основаниям конусов, без вида сверху или произвольного наклона.
+        inverse_z, rows = np.asarray(floor_samples).T
+        floor_projection = np.column_stack((inverse_z, np.ones_like(inverse_z)))
+        slope, horizon = np.linalg.lstsq(floor_projection, rows, rcond=None)[0]
+        x_cam = track.center[:, 0] - self.config.camera_offset_x
+        z_cam = track.center[:, 1] + self.config.camera_offset_z
+        u = self.fx * x_cam / z_cam + self.cx_cam
+        v = slope / z_cam + horizon
+        pixels = np.rint(np.column_stack((u, v))).astype(np.int32)
+        cv2.polylines(image, [pixels], False, self.config.trajectory_color,
+                      self.config.trajectory_thickness, cv2.LINE_AA)
 
     def _smooth_target(self, waypoint, captured_at):
         point = (waypoint['x'], waypoint['z'], waypoint['image_v'])
@@ -421,42 +416,12 @@ class VisionLoop:
                 }
         return waypoints_3d[-1]
 
-    def _draw_overlay(self, image_np, detections, waypoints_3d):
+    def _draw_overlay(self, image_np, detections):
         for det in detections:
             if self.config.draw_target_z and 'pos_3d' in det:
                 x1, y1, _, _ = det['bbox']
                 draw_outlined_text(image_np, f"Z_cam:{det['z_cam']:.2f}m", (x1, y1 - 25),
                                    self.config.z_text_scale, self.config.z_text_color, self.config.z_text_thickness)
-        if self.config.draw_trajectory:
-            pts_2d = [[image_np.shape[1]//2, image_np.shape[0]]]
-            for wp in sorted(waypoints_3d, key=lambda point: point['z']):
-                # Защита от деления на ноль: точки с z <= 0 не проецируем
-                if wp['z'] <= 0:
-                    continue
-                x_cam = wp['x'] - self.config.camera_offset_x
-                z_cam = wp['z'] + self.config.camera_offset_z
-                u = int((x_cam * self.fx / z_cam) + self.cx_cam)
-                v = int(wp['image_v'])
-                pts_2d.append([u, v])
-            if len(pts_2d) > 1:
-                pts_arr = np.array(pts_2d, np.int32).reshape((-1, 1, 2))
-                cv2.polylines(image_np, [pts_arr], isClosed=False, 
-                             color=self.config.trajectory_color, 
-                             thickness=self.config.trajectory_thickness)
-
-        # При краткой потере цели оставляем крест на последней сглаженной позиции.
-        if (self.robot_state['autopilot_mode'] != 'RACE' and self.config.draw_target and
-                self.smoothed_target is not None and
-                time.monotonic() - self.smoothed_target_at < self.TARGET_TIMEOUT):
-            target_x, target_z, target_v = self.smoothed_target
-            x_cam = target_x - self.config.camera_offset_x
-            z_cam = target_z + self.config.camera_offset_z
-            target_u = int((x_cam * self.fx / z_cam) + self.cx_cam)
-            cv2.drawMarker(image_np, (target_u, int(target_v)), (0, 0, 255),
-                          cv2.MARKER_CROSS, 
-                          self.config.target_cross_size, 
-                          self.config.target_cross_thickness)
-
         # ОТРИСОВКА КОНУСОВ (draw_detections) 
         if self.config.draw_detections:
             for det in detections:
@@ -476,14 +441,6 @@ class VisionLoop:
                 draw_outlined_text(image_np, cone_name, (x1, y1 - 10), 0.5, color, 2)
 
         # ЛИНИИ МЕЖДУ ПАРАМИ 
-        if self.config.pair_line_color:
-            for wp in waypoints_3d:
-                if wp.get('type') == 'pair':
-                    cv2.line(image_np, wp['b_cone']['center'], wp['y_cone']['center'], 
-                            self.config.pair_line_color, 
-                            self.config.pair_line_thickness)
-
-
     def _vision_loop(self):
         try:
             self._capture_loop()
@@ -618,7 +575,6 @@ class VisionLoop:
                         pass
 
                 detections = self.last_detections
-                waypoints_3d = self.last_waypoints_3d
                 target_z = self.last_target_z
                 target_detected = self.last_target_detected
 
@@ -670,12 +626,10 @@ class VisionLoop:
                     
                     used_yellows = set()
                     pairs_found_count = 0
-                    race_track = None
-                    if profile == 'RACE':
-                        race_track = build_race_track(blue_cones, yellow_cones,
-                                                      self.config.track_width, self.config.race)
+                    track = build_track_geometry(blue_cones, yellow_cones,
+                                                 self.config.track_width, self.config.track_geometry)
                     
-                    for b_cone in (blue_cones if profile != 'RACE' else ()):
+                    for b_cone in blue_cones:
                         best_y = None
                         best_diff = float('inf')
                         b_x, b_z = b_cone['pos_3d']
@@ -707,7 +661,7 @@ class VisionLoop:
                                                  'type': 'pair', 'b_cone': b_cone, 'y_cone': y_cone})
                             pairs_found_count += 1
 
-                    if profile != 'RACE' and pairs_found_count == 0:
+                    if pairs_found_count == 0:
                         for b_cone in blue_cones:
                             b_x, b_z = b_cone['pos_3d']
                             waypoints_3d.append({'x': b_x + self.config.virtual_point_offset, 'z': b_z,
@@ -727,7 +681,7 @@ class VisionLoop:
                     if orange_cones:
                         closest_orange = min(orange_cones, key=lambda c: c['pos_3d'][1])
                         distance_from_front = closest_orange['z_cam'] - self.config.camera_to_front_m
-                        if distance_from_front < 2.0 and profile != 'RACE':
+                        if distance_from_front < 2.0:
                             # На финишном участке ориентируемся только на стоп-конус.
                             o_x, o_z = closest_orange['pos_3d']
                             waypoints_3d = [{'x': o_x, 'z': o_z,
@@ -737,11 +691,7 @@ class VisionLoop:
 
                     target_x, target_z = None, None
                     target_wp = None
-                    if profile == 'RACE':
-                        self.smoothed_target = None
-                        if race_track.target is not None:
-                            target_z = float(race_track.target[1])
-                    elif waypoints_3d:
+                    if waypoints_3d:
                         # Pure Pursuit: выбираем точку на дистанции упреждения
                         target_wp = self._select_lookahead_target(waypoints_3d, self.config.lookahead_distance)
                         if target_wp and target_wp['z'] > 0:
@@ -758,8 +708,6 @@ class VisionLoop:
                                 self.car.stop()
                                 self.robot_state['msg'] = "ФИНИШ! ОРАНЖЕВЫЙ КОНУС."
                                 self.robot_state['msg_time'] = time.time()
-                            elif profile == 'RACE':
-                                self._drive_race(race_track, detected_at)
                             elif target_x is not None and target_z > 0:
                                 if detected_at - self.last_target_at >= self.TARGET_TIMEOUT:
                                     self._reset_pid()
@@ -782,15 +730,14 @@ class VisionLoop:
                                 self.speed_controller.reset()
 
                     self.last_detections = detections
-                    self.last_waypoints_3d = waypoints_3d
-                    self.last_race_track = race_track
+                    self.last_track_geometry = track
                     self.last_target_z = target_z
                     self.last_target_detected = target_detected
 
                 if time.monotonic() - self.last_detection_at >= self.TARGET_TIMEOUT:
-                    detections, waypoints_3d = [], []
+                    detections = []
                     target_z = None
-                    self.last_race_track = None
+                    self.last_track_geometry = None
 
                 # FPS
                 fps_counter += 1
@@ -809,11 +756,10 @@ class VisionLoop:
                 if publish_phase < self.config.zed_fps:
                     continue
                 publish_phase -= self.config.zed_fps
-                self._draw_overlay(image_np, detections, waypoints_3d)
-                race_selected = self.robot_state['autopilot_mode'] == 'RACE'
-                if race_selected:
-                    self._draw_race_track(image_np, self.last_race_track)
-                
+                self._draw_overlay(image_np, detections)
+                if self.config.draw_trajectory:
+                    self._draw_track_geometry(image_np, self.last_track_geometry, detections)
+
                 rec_x = 10
                 if self.config.draw_fps:
                     processing_text = f"PROC {current_fps:.1f} / "
@@ -824,18 +770,13 @@ class VisionLoop:
                     draw_outlined_text(image_np, f"STREAM {current_stream_fps:.1f}", (10 + text_width, 30),
                                        self.config.fps_text_scale, (0, 0, 255), self.config.fps_text_thickness)
                     mode_text = 'AUTO' if self.robot_state['auto_mode'] else 'MANUAL'
-                    labels = [mode_text]
-                    if race_selected:
-                        throttle = self.last_race_track.throttle if self.last_race_track is not None else 0.0
-                        labels.append(f'Gas {throttle:.2f}')
-                    for label in labels:
-                        draw_outlined_text(image_np, label, (rec_x, 55),
-                                           self.config.fps_text_scale, self.config.fps_text_color,
-                                           self.config.fps_text_thickness)
-                        (label_width, _), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX,
-                                                             self.config.fps_text_scale,
-                                                             self.config.fps_text_thickness)
-                        rec_x += label_width + 18
+                    draw_outlined_text(image_np, mode_text, (rec_x, 55),
+                                       self.config.fps_text_scale, self.config.fps_text_color,
+                                       self.config.fps_text_thickness)
+                    (mode_width, _), _ = cv2.getTextSize(mode_text, cv2.FONT_HERSHEY_SIMPLEX,
+                                                        self.config.fps_text_scale,
+                                                        self.config.fps_text_thickness)
+                    rec_x += mode_width + 18
                 if self.config.draw_target_z:
                     display_target_z = target_z if target_z is not None else 0.0
                     draw_outlined_text(image_np, f"Target Z: {display_target_z:.2f}m", (10, 115),
@@ -939,7 +880,7 @@ class VisionLoop:
         # Пересоздаём объекты
         self.running = True
         self.last_detection_at = 0.0
-        self.last_race_track = None
+        self.last_track_geometry = None
         self.smoothed_target = None
         self.is_recording = False
         self.fx = 0

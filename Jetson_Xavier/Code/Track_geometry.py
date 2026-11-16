@@ -1,4 +1,4 @@
-"""Локальный коридор Race в координатах (поперёк, вперёд), метры."""
+"""Геометрия трассы в координатах (поперёк, вперёд), метры."""
 
 from dataclasses import dataclass
 import math
@@ -8,12 +8,10 @@ import numpy as np
 
 
 @dataclass
-class RaceTrack:
+class TrackGeometry:
     blue: np.ndarray
     yellow: np.ndarray
     center: Optional[np.ndarray] = None
-    target: Optional[np.ndarray] = None
-    throttle: float = 0.0
 
 
 def _chain(cones, max_gap):
@@ -49,10 +47,10 @@ def _cross(a, b):
     return a[..., 0] * b[..., 1] - a[..., 1] * b[..., 0]
 
 
-def build_race_track(blue_cones, yellow_cones, track_width, settings):
+def build_track_geometry(blue_cones, yellow_cones, track_width, settings):
     blue = _chain(blue_cones, settings['max_cone_gap_m'])
     yellow = _chain(yellow_cones, settings['max_cone_gap_m'])
-    track = RaceTrack(blue, yellow)
+    track = TrackGeometry(blue, yellow)
     if min(len(blue), len(yellow)) < 2:
         return track
 
@@ -78,7 +76,7 @@ def build_race_track(blue_cones, yellow_cones, track_width, settings):
         return track
     blue, yellow, centers = blue[:count], yellow[:count], centers[:count]
     stations = _stations(centers)
-    if stations[-1] < max(settings['steering_lookahead_m'], 0.75):
+    if stations[-1] < 0.10:
         return track
 
     # Сглаживаем локально, затем проверяем точки и середины отрезков
@@ -102,35 +100,4 @@ def build_race_track(blue_cones, yellow_cones, track_width, settings):
     if not np.all(np.any(inside, axis=1)):
         return track
 
-    center_s = _stations(center)
-    # Цель руля берём по длине пути от проекции машинки на центральную линию.
-    segments = np.diff(center, axis=0)
-    lengths = np.linalg.norm(segments, axis=1)
-    if np.any(lengths < 1e-6):
-        return track
-    ratios = np.clip(-np.sum(center[:-1] * segments, axis=1) / lengths**2, 0, 1)
-    # Проекция на начало коридора, чтобы на шпильке не перескочить на выход.
-    near = max(1, int(np.searchsorted(center_s[:-1], settings['steering_lookahead_m'])))
-    closest = np.argmin(np.linalg.norm(center[:near] + ratios[:near, None] * segments[:near], axis=1))
-    start = center_s[closest] + ratios[closest] * lengths[closest]
-    lookahead = settings['steering_lookahead_m']
-    if center_s[-1] - start < lookahead:
-        return track
-    target = _at(center, center_s, start + lookahead)
-    if target[1] <= 0:
-        return track
-    # Изменение направления измеряем на фиксированном горизонте вдоль линии.
-    end = min(start + settings['turn_preview_m'], center_s[-1])
-    ahead = (center_s[:-1] < end) & (center_s[1:] > start)
-    angles = np.unwrap(np.arctan2(segments[ahead, 0], segments[ahead, 1]))
-    turn = math.degrees(float(np.max(angles) - np.min(angles)))
-    # Две хорды равной длины по дуге дают примерно половину её угла.
-    # Для редких конусов это компенсирует недооценку по направлениям сегментов.
-    preview = _at(centers, stations, [start, (start + end) / 2, end])
-    first, second = np.diff(preview, axis=0)
-    chord_turn = math.degrees(math.atan2(abs(_cross(first, second)), first @ second))
-    turn = max(turn, 2 * chord_turn)
-    throttle = max(0., 1. - turn / 90.)
-    if throttle < 0.08:
-        throttle = 0.  # Около 90° хорды между конусами слегка занижают угол дуги.
-    return RaceTrack(track.blue, track.yellow, center, target, throttle)
+    return TrackGeometry(track.blue, track.yellow, center)

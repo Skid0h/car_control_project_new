@@ -110,19 +110,13 @@ class Config:
         self.max_depth = ap['max_depth']
         self.min_depth = ap['min_depth']
         self.track_width = ap['track_width']
-        race = cfg.get('race', {})
-        self.race = {}
-        for key, default in (('max_cone_gap_m', 2.0),
-                             ('boundary_clearance_m', 0.25),
-                             ('steering_lookahead_m', 0.65),
-                             ('min_turn_radius_m', 0.70),
-                             ('turn_preview_m', 3.0)):
-            value = race.get(key, default)
+        geometry = cfg.get('track_geometry', {})
+        self.track_geometry = {}
+        for key, default in (('max_cone_gap_m', 2.0), ('boundary_clearance_m', 0.25)):
+            value = geometry.get(key, default)
             if type(value) not in (int, float) or not math.isfinite(value) or value <= 0:
-                raise ValueError(f'race.{key} должно быть положительным конечным числом')
-            self.race[key] = value
-        if self.race['turn_preview_m'] < self.race['steering_lookahead_m']:
-            raise ValueError('race.turn_preview_m должен быть не меньше steering_lookahead_m')
+                raise ValueError(f'track_geometry.{key} must be positive and finite')
+            self.track_geometry[key] = value
         self.lookahead_distance = ap['lookahead_distance']
         self.pair_z_tolerance = ap['pair_z_tolerance']
         self.pair_x_tolerance_multiplier = ap['pair_x_tolerance_multiplier']

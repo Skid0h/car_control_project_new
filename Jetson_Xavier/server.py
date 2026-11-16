@@ -73,7 +73,8 @@ class VisionLoop:
         self.last_detection_at = 0.0
         self.last_detections = []
         self.last_waypoints_3d = []
-        self.last_target_x = None
+        self.smoothed_target = None
+        self.smoothed_target_at = 0.0
         self.last_target_z = None
         self.last_target_detected = False
        
@@ -105,6 +106,8 @@ class VisionLoop:
         self.pid_prev_error = 0.0
         self.pid_prev_time = None
         self.pid_smoothed_error = 0.0
+        self.pid_derivative = 0.0
+        self.last_steering_command_at = time.monotonic()
 
     def enable_auto(self):
         with self.control_lock:
@@ -249,7 +252,7 @@ class VisionLoop:
 
         В отличие от простого P (steering = error * k), здесь:
           * I-часть убирает систематическое смещение (машину тянет к краю из-за кривого руля);
-          * D-часть демпфирует резкие движения руля;
+          * D-часть реагирует на скорость изменения ошибки, сглаженную по времени;
           * EMA-фильтр сглаживает шум от детекции конусов;
         Все коэффициенты берутся из блока 'pid' в config.jsonc.
         """
@@ -275,17 +278,36 @@ class VisionLoop:
 
         # Выход ПИД
         proportional = cfg.kp_gain * err
-        differential = cfg.kd_gain * derivative
+        alpha = -math.expm1(-dt / cfg.derivative_smoothing_s)
+        self.pid_derivative += alpha * (derivative - self.pid_derivative)
+        differential = cfg.kd_gain * self.pid_derivative
         raw_output = cfg.max_steering_output * (proportional + self.pid_integral + differential)
 
         # Ограничение максимального хода руля и приведение к [-1, 1]
         steer_limit = max(0.0, min(1.0, steer_limit))
-        output = max(-steer_limit, min(steer_limit, raw_output))
+        desired = max(-steer_limit, min(steer_limit, raw_output))
+        now = time.monotonic()
+        command_dt = min(now - self.last_steering_command_at, 0.1)
+        self.last_steering_command_at = now
+        max_step = cfg.max_steering_rate_deg_s * command_dt / max(1, cfg.steering_range)
+        change = max(-max_step, min(max_step, desired - self.last_steering))
+        output = self.last_steering + change
         pid_logger.debug(
-            "PID dt=%.3fs error=%.3f filtered=%.3f P=%.3f I=%.3f D=%.3f raw=%.3f steer=%.3f",
-            dt, error, err, proportional, self.pid_integral, differential, raw_output, output,
+            "PID dt=%.3fs error=%.3f filtered=%.3f P=%.3f I=%.3f D=%.3f desired=%.3f steer=%.3f",
+            dt, error, err, proportional, self.pid_integral, differential, desired, output,
         )
         return output
+
+    def _smooth_target(self, waypoint, captured_at):
+        point = (waypoint['x'], waypoint['z'], waypoint['image_v'])
+        dt = captured_at - self.smoothed_target_at
+        if self.smoothed_target is not None and 0 < dt < self.TARGET_TIMEOUT:
+            alpha = -math.expm1(-min(dt, 0.1) / self.config.target_smoothing_s)
+            point = tuple(old + alpha * (new - old)
+                          for old, new in zip(self.smoothed_target, point))
+        self.smoothed_target = point
+        self.smoothed_target_at = captured_at
+        return point
 
     def _select_lookahead_target(self, waypoints_3d, lookahead):
         """Интерполяция цели по продольной дистанции между точками пути."""
@@ -319,7 +341,7 @@ class VisionLoop:
                 }
         return waypoints_3d[-1]
 
-    def _draw_overlay(self, image_np, detections, waypoints_3d, target_x, target_z):
+    def _draw_overlay(self, image_np, detections, waypoints_3d):
         for det in detections:
             if self.config.draw_target_z and 'pos_3d' in det:
                 x1, y1, _, _ = det['bbox']
@@ -342,14 +364,14 @@ class VisionLoop:
                              color=self.config.trajectory_color, 
                              thickness=self.config.trajectory_thickness)
 
-        # Отрисовка цели только если z корректен для проекции
-        if self.config.draw_target and target_z is not None and target_z > 0:
+        # При краткой потере цели оставляем крест на последней сглаженной позиции.
+        if (self.config.draw_target and self.smoothed_target is not None and
+                time.monotonic() - self.smoothed_target_at < self.TARGET_TIMEOUT):
+            target_x, target_z, target_v = self.smoothed_target
             x_cam = target_x - self.config.camera_offset_x
             z_cam = target_z + self.config.camera_offset_z
             target_u = int((x_cam * self.fx / z_cam) + self.cx_cam)
-            target_wp = self._select_lookahead_target(waypoints_3d, self.config.lookahead_distance)
-            target_v = int(target_wp['image_v'])
-            cv2.drawMarker(image_np, (target_u, target_v), (0, 0, 255), 
+            cv2.drawMarker(image_np, (target_u, int(target_v)), (0, 0, 255),
                           cv2.MARKER_CROSS, 
                           self.config.target_cross_size, 
                           self.config.target_cross_thickness)
@@ -516,7 +538,6 @@ class VisionLoop:
 
                 detections = self.last_detections
                 waypoints_3d = self.last_waypoints_3d
-                target_x = self.last_target_x
                 target_z = self.last_target_z
                 target_detected = self.last_target_detected
 
@@ -633,9 +654,8 @@ class VisionLoop:
                     if len(waypoints_3d) > 0:
                         # Pure Pursuit: выбираем точку на дистанции упреждения
                         target_wp = self._select_lookahead_target(waypoints_3d, self.config.lookahead_distance)
-                        if target_wp:
-                            target_x = target_wp['x']
-                            target_z = target_wp['z']
+                        if target_wp and target_wp['z'] > 0:
+                            target_x, target_z, _ = self._smooth_target(target_wp, detected_at)
                         
                     # УПРАВЛЕНИЕ 
                     with self.control_lock:
@@ -667,17 +687,16 @@ class VisionLoop:
                                     self.robot_state['msg_time'] = time.time()
                             else:
                                 self.car.update(0.0, self.last_steering)
-                                self._reset_pid()
+                                self.speed_controller.reset()
 
                     self.last_detections = detections
                     self.last_waypoints_3d = waypoints_3d
-                    self.last_target_x = target_x
                     self.last_target_z = target_z
                     self.last_target_detected = target_detected
 
                 if time.monotonic() - self.last_detection_at >= self.TARGET_TIMEOUT:
                     detections, waypoints_3d = [], []
-                    target_x, target_z = None, None
+                    target_z = None
 
                 # FPS
                 fps_counter += 1
@@ -696,7 +715,7 @@ class VisionLoop:
                 if publish_phase < self.config.zed_fps:
                     continue
                 publish_phase -= self.config.zed_fps
-                self._draw_overlay(image_np, detections, waypoints_3d, target_x, target_z)
+                self._draw_overlay(image_np, detections, waypoints_3d)
                 
                 rec_x = 10
                 if self.config.draw_fps:
@@ -713,6 +732,14 @@ class VisionLoop:
                     (mode_width, _), _ = cv2.getTextSize(mode_text, cv2.FONT_HERSHEY_SIMPLEX,
                                                        self.config.fps_text_scale, self.config.fps_text_thickness)
                     rec_x += mode_width + 12
+                voltage = self.car.get_battery_voltage() if self.car is not None else None
+                battery_text = f'BAT {voltage:.2f} V' if voltage is not None else 'BAT -- V'
+                draw_outlined_text(image_np, battery_text, (rec_x, 55),
+                                   self.config.fps_text_scale, self.config.fps_text_color,
+                                   self.config.fps_text_thickness)
+                (battery_width, _), _ = cv2.getTextSize(battery_text, cv2.FONT_HERSHEY_SIMPLEX,
+                                                       self.config.fps_text_scale, self.config.fps_text_thickness)
+                rec_x += battery_width + 12
                 if self.config.draw_target_z:
                     display_target_z = target_z if target_z is not None else 0.0
                     draw_outlined_text(image_np, f"Target Z: {display_target_z:.2f}m", (10, 115),
@@ -816,6 +843,7 @@ class VisionLoop:
         # Пересоздаём объекты
         self.running = True
         self.last_detection_at = 0.0
+        self.smoothed_target = None
         self.is_recording = False
         self.fx = 0
         self.cx_cam = 0

@@ -54,6 +54,10 @@ class Config:
         # Car
         car = cfg['car']
         self.baud_rate = car['baud_rate']
+        self.battery_voltage_multiplier = car.get('battery_voltage_multiplier', 1.0)
+        if (type(self.battery_voltage_multiplier) not in (int, float) or
+                not math.isfinite(self.battery_voltage_multiplier) or self.battery_voltage_multiplier <= 0):
+            raise ValueError('car.battery_voltage_multiplier должно быть положительным конечным числом')
         self.neutral_speed = car['neutral_speed']
         self.forward_speed = car['forward_speed']
         self.back_speed = car['back_speed']
@@ -89,6 +93,13 @@ class Config:
         # PID
         pid = cfg['pid']
         self.pid_debug = pid.get('debug', False)
+        for key, default in (('target_smoothing_s', 0.20),
+                             ('derivative_smoothing_s', 0.15),
+                             ('max_steering_rate_deg_s', 60.0)):
+            value = pid.get(key, default)
+            if type(value) not in (int, float) or not math.isfinite(value) or value <= 0:
+                raise ValueError(f'pid.{key} должно быть положительным конечным числом')
+            setattr(self, key, value)
         self.kp_gain = pid['kp_gain']
         self.ki_gain = pid['ki_gain']
         self.kd_gain = pid['kd_gain']

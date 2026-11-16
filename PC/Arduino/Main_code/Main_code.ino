@@ -8,6 +8,8 @@
 const int MOTOR_PIN = 6;              // ESC двигателя
 const int STEERING_PIN = 8;           // Сервопривод руля
 const int SPEED_SENSOR_PIN = A0;      // Датчик скорости (аналоговый вход)
+const int BATTERY_VOLTAGE_PIN = A3;   // Вход измерения напряжения
+const unsigned long BATTERY_INTERVAL = 200;  // Интервал телеметрии, мс
 
 // Serial
 const long SERIAL_BAUD = 9600;        // Скорость UART
@@ -26,7 +28,7 @@ const int STEERING_MIN = 0;            // Минимальный угол
 const int STEERING_MAX = 180;          // Максимальный угол
 const int STEERING_CENTER = 92;        // Центральное положение
 const int STEERING_STEP = 3;           // Минимальный физический шаг, градусы
-const unsigned long STEERING_INTERVAL = 20; // Интервал движения, мс
+const unsigned long STEERING_INTERVAL = 30; // Интервал движения, мс
 
 // Датчик скорости
 const int Td = 10;                     // Интервал опроса датчика, мс
@@ -77,6 +79,7 @@ void setup() {
   steeringServo.attach(STEERING_PIN);
 
   pinMode(SPEED_SENSOR_PIN, INPUT);
+  pinMode(BATTERY_VOLTAGE_PIN, INPUT);
   pinMode(LED_BUILTIN, OUTPUT);
 
   stopCar();
@@ -105,6 +108,23 @@ void loop() {
     stopCar();
     failsafeActive = true;
   }
+
+  updateBatteryVoltage();
+}
+
+void updateBatteryVoltage() {
+  static unsigned long lastBatteryUpdate = 0;
+  const unsigned long now = millis();
+  // "V:5.00\r\n" занимает 8 байт. Не ждём освобождения буфера UART.
+  if (now - lastBatteryUpdate < BATTERY_INTERVAL || Serial.availableForWrite() < 8) {
+    return;
+  }
+  lastBatteryUpdate = now;
+
+  const int raw = analogRead(BATTERY_VOLTAGE_PIN);
+  const float voltage = raw * (5.0 / 1023.0);
+  Serial.print("V:");
+  Serial.println(voltage, 2);
 }
 
 // ==================================================

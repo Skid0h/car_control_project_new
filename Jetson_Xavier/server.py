@@ -342,11 +342,6 @@ class VisionLoop:
         return waypoints_3d[-1]
 
     def _draw_overlay(self, image_np, detections, waypoints_3d):
-        for det in detections:
-            if self.config.draw_target_z and 'pos_3d' in det:
-                x1, y1, _, _ = det['bbox']
-                draw_outlined_text(image_np, f"Z_cam:{det['z_cam']:.2f}m", (x1, y1 - 25),
-                                   self.config.z_text_scale, self.config.z_text_color, self.config.z_text_thickness)
         if self.config.draw_trajectory:
             pts_2d = [[image_np.shape[1]//2, image_np.shape[0]]]
             for wp in sorted(waypoints_3d, key=lambda point: point['z']):
@@ -392,7 +387,6 @@ class VisionLoop:
                     color = (255, 255, 255)
                 
                 cv2.rectangle(image_np, (x1, y1), (x2, y2), color, 2)
-                draw_outlined_text(image_np, cone_name, (x1, y1 - 10), 0.5, color, 2)
 
         # ЛИНИИ МЕЖДУ ПАРАМИ 
         if self.config.pair_line_color:
@@ -402,6 +396,41 @@ class VisionLoop:
                             self.config.pair_line_color, 
                             self.config.pair_line_thickness)
 
+        self._draw_cone_labels(image_np, detections)
+
+    def _draw_cone_labels(self, image, detections):
+        # Ближние конусы получают верхние строки и место раньше дальних.
+        ordered = sorted(detections, key=lambda det: det.get('z_cam', float('inf')))
+        height, width = image.shape[:2]
+        scale = self.config.z_text_scale
+        thickness = self.config.z_text_thickness
+        labels = []
+        next_top = 170  # Верхний левый блок телеметрии заканчивается на y=145.
+        for det in ordered:
+            name = det.get('name', '') if self.config.draw_detections else ''
+            distance = (f"Z_cam {det['z_cam']:.2f} m"
+                        if self.config.draw_target_z and 'pos_3d' in det else '')
+            text = ' '.join(part for part in (name, distance) if part)
+            if not text:
+                continue
+            (text_width, text_height), baseline = cv2.getTextSize(
+                text, cv2.FONT_HERSHEY_SIMPLEX, scale, thickness)
+            box_height = text_height + baseline + 10
+            if next_top + box_height >= height or text_width + 10 > width:
+                continue  # При нехватке места приоритет уже получили ближние конусы.
+            x1, y1, x2, _ = det['bbox']
+            left = max(0, min(int((x1 + x2 - text_width) / 2), width - text_width - 10))
+            right = left + text_width + 10
+            bottom = next_top + box_height
+            labels.append((text, left, next_top, right, bottom, text_height))
+            cv2.line(image, ((left + right) // 2, bottom),
+                     (int((x1 + x2) / 2), int(y1)), self.config.z_text_color, 1, cv2.LINE_AA)
+            next_top = bottom + 4
+        # Фон и текст поверх всех рамок и соединительных линий.
+        for text, left, top, right, bottom, text_height in reversed(labels):
+            cv2.rectangle(image, (left, top), (right, bottom), (0, 0, 0), -1)
+            draw_outlined_text(image, text, (left + 5, top + 5 + text_height),
+                               scale, self.config.z_text_color, thickness)
 
     def _vision_loop(self):
         try:

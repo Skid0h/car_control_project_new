@@ -2,12 +2,14 @@ from flask import Flask, Response, render_template_string
 import cv2
 import numpy as np
 import threading
+import time
 
 app = Flask(__name__)
 
 current_jpeg = None
 frame_lock = threading.Lock()
-frame_event = threading.Event()
+frame_cond = threading.Condition(frame_lock)  # Condition — издатель и подписчики
+frame_seq = 0  # Счётчик кадров для отслеживания новых кадров
 
 HTML = """
 <!DOCTYPE html>
@@ -28,16 +30,18 @@ HTML = """
 
 def set_frame(frame):
     """Основной код вызывает эту функцию чтобы обновить кадр"""
-    global current_jpeg
+    global current_jpeg, frame_seq
     if frame is None:
-        return
+        return False
     ret, jpeg = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 70])
     if not ret:
-        return
+        return False
     jpeg_bytes = jpeg.tobytes()
-    with frame_lock:
+    with frame_cond:
         current_jpeg = jpeg_bytes
-    frame_event.set()
+        frame_seq += 1  # Увеличиваем счётчик для отслеживания новых кадров
+        frame_cond.notify_all()  # Будим всех ждущих зрителей
+    return True
 
 @app.route('/')
 def index():
@@ -46,14 +50,24 @@ def index():
 @app.route('/video')
 def video():
     def generate():
+        last_seq = 0
         while True:
-            frame_event.wait(timeout=1.0)
-            frame_event.clear()
-            with frame_lock:
+            # Ждём новый кадр с таймаутом для поддержки keep-alive
+            with frame_cond:
+                if frame_seq == last_seq:
+                    frame_cond.wait(timeout=1.0)
                 jpeg_bytes = current_jpeg
-            if jpeg_bytes is None:
+                seq = frame_seq
+            
+            # Если это тот же кадр - пропускаем
+            if jpeg_bytes is None or seq == last_seq:
                 continue
+            
+            last_seq = seq
             yield (b'--frame\r\nContent-Type: image/jpeg\r\n\r\n' + jpeg_bytes + b'\r\n')
+            
+            # Небольшая задержка чтобы не нагружать сеть
+            time.sleep(0.01)
     return Response(generate(), mimetype='multipart/x-mixed-replace; boundary=frame')
 
 def start():

@@ -6,10 +6,33 @@
 import os
 import sys
 import json
+import math
 import re
 
 
 class Config:
+    # Совместимость с examples/calibrate_depth.py, который читает эти атрибуты.
+    area_depth_constant = 100.0
+    cone_colors = {"yellow": (0, 255, 255), "orange": (0, 165, 255), "blue": (255, 0, 0)}
+
+    def cone_distance_from_area(self, area, cone_name):
+        """Расстояние от камеры, м; калибровка по площади bbox в исходном кадре."""
+        calibration = self.area_depth_calibration.get(cone_name)
+        if calibration is None:
+            return self.area_depth_constant / math.sqrt(area)
+        z = calibration['scale'] / math.sqrt(area) + calibration['offset']
+        anchors = calibration.get('distance_correction', [])
+        if not anchors or z <= anchors[0][0]:
+            return z
+
+        # Между контрольными замерами плавно меняем поправку.
+        for (near_z, near_true), (far_z, far_true) in zip(anchors, anchors[1:]):
+            if z <= far_z:
+                weight = (z - near_z) / (far_z - near_z)
+                return near_true + weight * (far_true - near_true)
+        last_z, last_true = anchors[-1]
+        return z + (last_true - last_z)
+
     def __init__(self, config_path="config.jsonc"):
         if not os.path.exists(config_path):
             print(f"Файл конфигурации '{config_path}' не найден.")
@@ -18,7 +41,9 @@ class Config:
         with open(config_path, 'r', encoding='utf-8') as f:
             content = f.read()
         
-        content = re.sub(r'//.*', '', content)
+        # Сохраняем строки JSON, включая URL и экранированные кавычки.
+        content = re.sub(r'("(?:\\.|[^"\\])*")|//[^\r\n]*',
+                         lambda match: match.group(1) or '', content)
         cfg = json.loads(content)
         
         # Network
@@ -36,9 +61,41 @@ class Config:
         self.command_interval = car['command_interval']
         self.watchdog_timeout = car['watchdog_timeout']
         self.steering_range = car['steering_range']
+        self.esc_min = car['esc_min']
+        self.esc_max = car['esc_max']
+        self.auto_speed = cfg['auto_speed']
+        speed = self.auto_speed
+        speed.setdefault('ramp_pwm', speed['start_pwm'])
+        speed.setdefault('ramp_interval_s', 0.3)
+        speed.setdefault('settle_time_s', 0.0)
+        for key, value in speed.items():
+            if type(value) not in (int, float) or not math.isfinite(value):
+                raise ValueError(f'auto_speed.{key} должно быть конечным числом')
+        if not (self.neutral_speed < speed['min_pwm'] <= speed['start_pwm'] <=
+                speed['ramp_pwm'] <= speed['max_pwm'] <= self.esc_max):
+            raise ValueError('Некорректные границы ШИМ auto_speed')
+        for key in ('min_pwm', 'start_pwm', 'ramp_pwm', 'max_pwm', 'step_pwm'):
+            if type(speed[key]) is not int:
+                raise ValueError(f'auto_speed.{key} должно быть целым числом')
+        for key in ('target_kmh', 'step_pwm', 'increase_interval_s', 'decrease_interval_s',
+                    'startup_timeout_s', 'sensor_timeout_s', 'ramp_interval_s'):
+            if speed[key] <= 0:
+                raise ValueError(f'auto_speed.{key} должно быть положительным')
+        if not 0 <= speed['deadband_kmh'] < speed['target_kmh']:
+            raise ValueError('Некорректный допуск скорости')
+        if speed['settle_time_s'] < 0:
+            raise ValueError('auto_speed.settle_time_s не может быть отрицательным')
         
         # PID
         pid = cfg['pid']
+        self.pid_debug = pid.get('debug', False)
+        for key, default in (('target_smoothing_s', 0.20),
+                             ('derivative_smoothing_s', 0.15),
+                             ('max_steering_rate_deg_s', 60.0)):
+            value = pid.get(key, default)
+            if type(value) not in (int, float) or not math.isfinite(value) or value <= 0:
+                raise ValueError(f'pid.{key} должно быть положительным конечным числом')
+            setattr(self, key, value)
         self.kp_gain = pid['kp_gain']
         self.ki_gain = pid['ki_gain']
         self.kd_gain = pid['kd_gain']
@@ -59,37 +116,37 @@ class Config:
         self.virtual_point_offset = ap['virtual_point_offset']
         self.virtual_steer_k = ap['virtual_steer_k']
         self.stop_cone_z_threshold = ap['stop_cone_z_threshold']
-        self.area_depth_constant = ap['area_depth_constant']
+        self.area_depth_calibration = ap.get('area_depth_calibration', {})
+        self.graceful_degradation_speed = ap['graceful_degradation_speed']
         
         # Vision
         vis = cfg['vision']
         self.yolo_model_path = vis['yolo_model_path']
         self.confidence_threshold = vis['confidence_threshold']
         self.iou_threshold = vis['iou_threshold']
-        self.target_fps = vis['target_fps']
+        # fps задаёт отрисовку и стрим, camera_fps — захват и основной цикл.
+        self.fps = int(vis.get('fps', 15))
+        self.zed_fps = int(vis.get('camera_fps', 30))
+        if not 1 <= self.fps <= self.zed_fps <= 30:
+            raise ValueError('Требуется 1 <= vision.fps <= vision.camera_fps <= 30')
+        self.target_fps = float(self.zed_fps)
         self.output_folder = vis['output_folder']
         self.camera_offset_x = vis['camera_offset_x']
         self.camera_offset_z = vis['camera_offset_z']
+        self.camera_to_front_m = vis.get('camera_to_front_m', self.camera_offset_z)
         self.zed_resolution = vis['zed_resolution']
-        self.zed_fps = vis['zed_fps']
         self.depth_mode = vis['depth_mode']
         self.coordinate_units = vis['coordinate_units']
-        self.cone_base_v = vis['cone_base_v']
         self.point_of_view_offset_y = vis['point_of_view_offset_y']
         self.target_cross_size = vis['target_cross_size']
         self.target_cross_thickness = vis['target_cross_thickness']
         
         # Detection
         det = cfg['detection']
-        self.cone_colors = det['cone_colors']
         self.class_names = det['class_names']
         self.blue_cones = det['blue_cones']
         self.yellow_cones = det['yellow_cones']
         self.orange_cones = det['orange_cones']
-        self.circle_marker_radius = det['circle_marker_radius']
-        self.circle_marker_color = det['circle_marker_color']
-        self.text_scale = det['text_scale']
-        self.text_thickness = det['text_thickness']
         self.z_text_scale = det['z_text_scale']
         self.z_text_thickness = det['z_text_thickness']
         self.z_text_color = det['z_text_color']
@@ -101,10 +158,14 @@ class Config:
         self.draw_target = disp['draw_target']
         self.draw_fps = disp['draw_fps']
         self.draw_target_z = disp['draw_target_z']
+        self.draw_speed = disp['draw_speed']
         self.draw_rec = disp['draw_rec']
         self.fps_text_scale = disp['fps_text_scale']
         self.fps_text_thickness = disp['fps_text_thickness']
         self.fps_text_color = disp['fps_text_color']
+        self.speed_text_scale = disp['speed_text_scale']
+        self.speed_text_thickness = disp['speed_text_thickness']
+        self.speed_text_color = disp['speed_text_color']
         self.target_z_text_scale = disp['target_z_text_scale']
         self.target_z_text_thickness = disp['target_z_text_thickness']
         self.target_z_text_color = disp['target_z_text_color']
@@ -113,10 +174,6 @@ class Config:
         self.rec_text_color = disp['rec_text_color']
         self.trajectory_thickness = disp['trajectory_thickness']
         self.trajectory_color = disp['trajectory_color']
-        self.waypoint_radius = disp['waypoint_radius']
-        self.waypoint_color_pair = disp['waypoint_color_pair']
-        self.waypoint_color_virtual = disp['waypoint_color_virtual']
-        self.waypoint_color_stop = disp['waypoint_color_stop']
         self.pair_line_thickness = disp['pair_line_thickness']
         self.pair_line_color = disp['pair_line_color']
         

@@ -30,8 +30,7 @@ class CarController:
         self.arduino = None
         self.current_speed   = 0.0                                      # Показание скорости от Arduino
         self._speed_sample = (0.0, 0.0)
-        self._battery_sample = (None, 0.0)
-        self._reader_thread  = None                                     # Поток чтения телеметрии из UART
+        self._reader_thread  = None                                     # Поток чтения скорости из UART
 
         port = find_arduino_port()
         if port is None: return
@@ -46,7 +45,7 @@ class CarController:
             self.arduino = None
 
     def _start_reader(self):
-        """Запуск потока чтения телеметрии от Arduino."""
+        """Запуск потока чтения строк вида S:<скорость> от Arduino"""
         self._reader_generation = getattr(self, '_reader_generation', 0) + 1
         gen = self._reader_generation
         self._reader_thread = threading.Thread(target=self._read_loop, args=(gen,), daemon=True)
@@ -65,29 +64,18 @@ class CarController:
                 if self.arduino is ser:
                     self.arduino = None
                 return
-            field, _, value_text = line.partition(':')
-            if field not in ('S', 'Speed', 'V'):
+            if not line:
                 continue
-            try:
-                value = float(value_text)
-            except ValueError:
-                continue
-            if (not math.isfinite(value) or self.arduino is not ser or
-                    generation != self._reader_generation):
-                continue
-            sample = (value, time.monotonic())
-            if field == 'V':
-                if 0.0 <= value <= 5.0:
-                    self._battery_sample = sample
-            else:
-                self.current_speed = value
-                self._speed_sample = sample
-
-    def get_battery_voltage(self):
-        voltage, received_at = self._battery_sample
-        if self.arduino is None or time.monotonic() - received_at >= 1.0:
-            return None
-        return None if voltage is None else voltage * self.config.battery_voltage_multiplier
+            # Формат от Arduino: "S:12.34" (или debug-строка "Speed: 12.34")
+            if line.startswith(('S:', 'Speed:')):
+                try:
+                    speed = float(line.split(':', 1)[1])
+                except ValueError:
+                    continue
+                if (math.isfinite(speed) and self.arduino is ser and
+                        generation == self._reader_generation):
+                    self.current_speed = speed
+                    self._speed_sample = (speed, time.monotonic())
 
     def get_speed(self):
         """Показание скорости от Arduino без пересчёта."""
@@ -163,7 +151,6 @@ class CarController:
         time.sleep(self.config.arduino_close_delay)
         if self.arduino: self.arduino.close()
         self.arduino = None
-        self._battery_sample = (None, 0.0)
     
     def restart(self):
         """Перезагрузка подключения Arduino"""

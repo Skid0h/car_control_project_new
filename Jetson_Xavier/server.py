@@ -732,14 +732,6 @@ class VisionLoop:
                     (mode_width, _), _ = cv2.getTextSize(mode_text, cv2.FONT_HERSHEY_SIMPLEX,
                                                        self.config.fps_text_scale, self.config.fps_text_thickness)
                     rec_x += mode_width + 12
-                voltage = self.car.get_battery_voltage() if self.car is not None else None
-                battery_text = f'BAT {voltage:.2f} V' if voltage is not None else 'BAT -- V'
-                draw_outlined_text(image_np, battery_text, (rec_x, 55),
-                                   self.config.fps_text_scale, self.config.fps_text_color,
-                                   self.config.fps_text_thickness)
-                (battery_width, _), _ = cv2.getTextSize(battery_text, cv2.FONT_HERSHEY_SIMPLEX,
-                                                       self.config.fps_text_scale, self.config.fps_text_thickness)
-                rec_x += battery_width + 12
                 if self.config.draw_target_z:
                     display_target_z = target_z if target_z is not None else 0.0
                     draw_outlined_text(image_np, f"Target Z: {display_target_z:.2f}m", (10, 115),

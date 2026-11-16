@@ -6,7 +6,6 @@
 
   "car": {
     "baud_rate"        : 9600,
-    "battery_voltage_multiplier": 2.0, // Напряжение батареи = напряжение на A3 × коэффициент
     "neutral_speed"    : 1500,   // ШИМ для нейтрального положения мотора
     "forward_speed"    : 1570,
     "back_speed"       : 1420,

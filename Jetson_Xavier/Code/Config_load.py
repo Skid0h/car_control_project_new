@@ -54,10 +54,6 @@ class Config:
         # Car
         car = cfg['car']
         self.baud_rate = car['baud_rate']
-        self.battery_voltage_multiplier = car.get('battery_voltage_multiplier', 1.0)
-        if (type(self.battery_voltage_multiplier) not in (int, float) or
-                not math.isfinite(self.battery_voltage_multiplier) or self.battery_voltage_multiplier <= 0):
-            raise ValueError('car.battery_voltage_multiplier должно быть положительным конечным числом')
         self.neutral_speed = car['neutral_speed']
         self.forward_speed = car['forward_speed']
         self.back_speed = car['back_speed']

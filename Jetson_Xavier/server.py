@@ -113,7 +113,7 @@ class VisionLoop:
     def enable_auto(self):
         with self.control_lock:
             if self.robot_state['autopilot_mode'] == 'RACE':
-                self.robot_state['msg'] = 'RACE is not available yet'
+                self.robot_state['msg'] = 'В разработке...'
                 self.robot_state['msg_time'] = time.time()
             elif not self.robot_state['cam_connected']:
                 self.robot_state['msg'] = 'АВТОРЕЖИМ НЕДОСТУПЕН: НЕТ КАДРОВ С КАМЕРЫ'

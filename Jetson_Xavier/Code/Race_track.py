@@ -2,6 +2,7 @@
 
 from dataclasses import dataclass
 import math
+from typing import Optional
 
 import numpy as np
 
@@ -10,10 +11,9 @@ import numpy as np
 class RaceTrack:
     blue: np.ndarray
     yellow: np.ndarray
-    center: np.ndarray
-    target: np.ndarray
-    turn_deg: float
-    throttle: float
+    center: Optional[np.ndarray] = None
+    target: Optional[np.ndarray] = None
+    throttle: float = 0.0
 
 
 def _chain(cones, max_gap):
@@ -52,8 +52,9 @@ def _cross(a, b):
 def build_race_track(blue_cones, yellow_cones, track_width, settings):
     blue = _chain(blue_cones, settings['max_cone_gap_m'])
     yellow = _chain(yellow_cones, settings['max_cone_gap_m'])
+    track = RaceTrack(blue, yellow)
     if min(len(blue), len(yellow)) < 2:
-        return None
+        return track
 
     blue_s, yellow_s = _stations(blue), _stations(yellow)
     # Согласуем относительный прогресс по обеим границам: на дуге внешняя длиннее.
@@ -74,11 +75,11 @@ def build_race_track(blue_cones, yellow_cones, track_width, settings):
     invalid = np.flatnonzero(~valid)
     count = int(invalid[0]) if len(invalid) else len(valid)
     if count < 3:
-        return None
+        return track
     blue, yellow, centers = blue[:count], yellow[:count], centers[:count]
     stations = _stations(centers)
     if stations[-1] < max(settings['steering_lookahead_m'], 0.75):
-        return None
+        return track
 
     # Сглаживаем локально, затем проверяем точки и середины отрезков
     # в коридоре, сдвинутом внутрь на запас до каждой границы.
@@ -86,7 +87,7 @@ def build_race_track(blue_cones, yellow_cones, track_width, settings):
     safe_blue, safe_yellow = blue + inset, yellow - inset
     cells = np.stack([safe_blue[:-1], safe_yellow[:-1], safe_yellow[1:], safe_blue[1:]], axis=1)
     edges = np.roll(cells, -1, axis=1) - cells
-    sample_s = np.r_[np.arange(0., stations[-1], 0.10), stations[-1]]
+    sample_s = np.linspace(0., stations[-1], math.ceil(stations[-1] / 0.10) + 1)
     center = _at(centers, stations, sample_s)
     if len(center) >= 5:
         filtered = center.copy()
@@ -99,14 +100,14 @@ def build_race_track(blue_cones, yellow_cones, track_width, settings):
     crosses = _cross(edges[None, :, :, :], samples[:, None, None, :] - cells[None, :, :, :])
     inside = np.all(crosses >= -1e-7, axis=2) | np.all(crosses <= 1e-7, axis=2)
     if not np.all(np.any(inside, axis=1)):
-        return None
+        return track
 
     center_s = _stations(center)
     # Цель руля берём по длине пути от проекции машинки на центральную линию.
     segments = np.diff(center, axis=0)
     lengths = np.linalg.norm(segments, axis=1)
     if np.any(lengths < 1e-6):
-        return None
+        return track
     ratios = np.clip(-np.sum(center[:-1] * segments, axis=1) / lengths**2, 0, 1)
     # Проекция на начало коридора, чтобы на шпильке не перескочить на выход.
     near = max(1, int(np.searchsorted(center_s[:-1], settings['steering_lookahead_m'])))
@@ -114,10 +115,10 @@ def build_race_track(blue_cones, yellow_cones, track_width, settings):
     start = center_s[closest] + ratios[closest] * lengths[closest]
     lookahead = settings['steering_lookahead_m']
     if center_s[-1] - start < lookahead:
-        return None
+        return track
     target = _at(center, center_s, start + lookahead)
     if target[1] <= 0:
-        return None
+        return track
     # Изменение направления измеряем на фиксированном горизонте вдоль линии.
     end = min(start + settings['turn_preview_m'], center_s[-1])
     ahead = (center_s[:-1] < end) & (center_s[1:] > start)
@@ -132,4 +133,4 @@ def build_race_track(blue_cones, yellow_cones, track_width, settings):
     throttle = max(0., 1. - turn / 90.)
     if throttle < 0.08:
         throttle = 0.  # Около 90° хорды между конусами слегка занижают угол дуги.
-    return RaceTrack(blue, yellow, center, target, turn, throttle)
+    return RaceTrack(track.blue, track.yellow, center, target, throttle)

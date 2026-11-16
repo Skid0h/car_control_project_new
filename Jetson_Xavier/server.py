@@ -342,7 +342,7 @@ class VisionLoop:
 
     def _drive_race(self, track, detected_at):
         neutral = self.config.neutral_speed
-        if track is None:
+        if track is None or track.target is None:
             self.speed_controller.pwm = neutral
             self.car.update_pwm(neutral, self.last_steering)
             return
@@ -358,17 +358,16 @@ class VisionLoop:
 
     def _draw_race_track(self, image, track):
         height, width = image.shape[:2]
-        size = min(240, height // 2, width // 3)
+        size = min(360, height * 2 // 3, width // 3)
         if size < 125:
             return
         panel = image[10:10 + size, width - size - 10:width - 10]
         panel[:] = (24, 24, 24)
         if track is None:
-            draw_outlined_text(panel, 'RACE: NO CORRIDOR', (8, 19), 0.40, (255, 255, 255), 1)
             return
         points = np.vstack(([0., 0.], track.blue, track.yellow))
         lower, upper = points.min(axis=0), points.max(axis=0)
-        scale = (size - 45) / max(*(upper - lower), 1.)
+        scale = (size - 60) / max(*(upper - lower), 1.)
         mid = (lower + upper) / 2
 
         def pixels(line):
@@ -376,11 +375,8 @@ class VisionLoop:
 
         for line, color in ((track.blue, (255, 125, 40)), (track.yellow, (0, 225, 255)),
                             (track.center, (65, 235, 80))):
-            cv2.polylines(panel, [pixels(line)], False, color, 2, cv2.LINE_AA)
-        cv2.circle(panel, tuple(pixels(np.zeros(2))), 4, (255, 255, 255), -1)
-        cv2.circle(panel, tuple(pixels(track.target)), 4, (80, 80, 255), -1)
-        draw_outlined_text(panel, f'RACE {track.turn_deg:.0f} deg / {track.throttle:.2f}',
-                           (8, 19), 0.40, (255, 255, 255), 1)
+            if line is not None and len(line) >= 2:
+                cv2.polylines(panel, [pixels(line)], False, color, 3, cv2.LINE_AA)
 
     def _smooth_target(self, waypoint, captured_at):
         point = (waypoint['x'], waypoint['z'], waypoint['image_v'])
@@ -449,7 +445,8 @@ class VisionLoop:
                              thickness=self.config.trajectory_thickness)
 
         # При краткой потере цели оставляем крест на последней сглаженной позиции.
-        if (self.config.draw_target and self.smoothed_target is not None and
+        if (self.robot_state['autopilot_mode'] != 'RACE' and self.config.draw_target and
+                self.smoothed_target is not None and
                 time.monotonic() - self.smoothed_target_at < self.TARGET_TIMEOUT):
             target_x, target_z, target_v = self.smoothed_target
             x_cam = target_x - self.config.camera_offset_x
@@ -742,7 +739,7 @@ class VisionLoop:
                     target_wp = None
                     if profile == 'RACE':
                         self.smoothed_target = None
-                        if race_track is not None:
+                        if race_track.target is not None:
                             target_z = float(race_track.target[1])
                     elif waypoints_3d:
                         # Pure Pursuit: выбираем точку на дистанции упреждения
@@ -813,7 +810,8 @@ class VisionLoop:
                     continue
                 publish_phase -= self.config.zed_fps
                 self._draw_overlay(image_np, detections, waypoints_3d)
-                if self.robot_state['autopilot_mode'] == 'RACE' and self.config.draw_trajectory:
+                race_selected = self.robot_state['autopilot_mode'] == 'RACE'
+                if race_selected:
                     self._draw_race_track(image_np, self.last_race_track)
                 
                 rec_x = 10
@@ -826,11 +824,18 @@ class VisionLoop:
                     draw_outlined_text(image_np, f"STREAM {current_stream_fps:.1f}", (10 + text_width, 30),
                                        self.config.fps_text_scale, (0, 0, 255), self.config.fps_text_thickness)
                     mode_text = 'AUTO' if self.robot_state['auto_mode'] else 'MANUAL'
-                    draw_outlined_text(image_np, mode_text, (10, 55),
-                                       self.config.fps_text_scale, self.config.fps_text_color, self.config.fps_text_thickness)
-                    (mode_width, _), _ = cv2.getTextSize(mode_text, cv2.FONT_HERSHEY_SIMPLEX,
-                                                       self.config.fps_text_scale, self.config.fps_text_thickness)
-                    rec_x += mode_width + 12
+                    labels = [mode_text]
+                    if race_selected:
+                        throttle = self.last_race_track.throttle if self.last_race_track is not None else 0.0
+                        labels.append(f'Gas {throttle:.2f}')
+                    for label in labels:
+                        draw_outlined_text(image_np, label, (rec_x, 55),
+                                           self.config.fps_text_scale, self.config.fps_text_color,
+                                           self.config.fps_text_thickness)
+                        (label_width, _), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX,
+                                                             self.config.fps_text_scale,
+                                                             self.config.fps_text_thickness)
+                        rec_x += label_width + 18
                 if self.config.draw_target_z:
                     display_target_z = target_z if target_z is not None else 0.0
                     draw_outlined_text(image_np, f"Target Z: {display_target_z:.2f}m", (10, 115),

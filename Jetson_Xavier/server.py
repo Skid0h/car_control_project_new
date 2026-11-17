@@ -63,6 +63,7 @@ class VisionLoop:
         self.robot_state = robot_state
         self.control_lock = threading.Lock()
         self.last_target_at = None
+        self.target_available = False
         self.last_steering = 0.0
 
         self.zed = sl.Camera()
@@ -122,6 +123,7 @@ class VisionLoop:
                 self.car.stop()
                 self._reset_pid()
                 self.last_target_at = time.monotonic()
+                self.target_available = False
                 self.last_steering = 0.0
                 self.robot_state['auto_mode'] = True
                 self.robot_state['msg'] = ''
@@ -170,13 +172,30 @@ class VisionLoop:
                 self.robot_state['msg'] = 'ПОТЕРЯ КАМЕРЫ: АВТОРЕЖИМ ОТКЛЮЧЁН'
                 self.robot_state['msg_time'] = time.time()
 
-    def check_target_timeout(self):
+    def _stop_for_missing_target(self):
+        # Вызывается под control_lock, чтобы регулятор не вернул тягу после остановки.
+        if self.target_available:
+            self.target_available = False
+            self._reset_pid()
+        self.car.update(0.0, self.last_steering)
+
+    def update_autopilot_speed(self):
         with self.control_lock:
-            if (self.robot_state['auto_mode'] and
+            if not self.robot_state['auto_mode']:
+                return
+            if (not self.target_available or
                     time.monotonic() - self.last_target_at >= self.TARGET_TIMEOUT):
-                if self.pid_prev_time is not None:
-                    self._reset_pid()
-                self.car.update(0.0, self.last_steering)
+                self._stop_for_missing_target()
+                return
+            try:
+                pwm = self._autopilot_pwm()
+                self.car.update_pwm(pwm, self.last_steering)
+            except TimeoutError as exc:
+                self.robot_state['auto_mode'] = False
+                self.car.stop()
+                self._reset_pid()
+                self.robot_state['msg'] = str(exc)
+                self.robot_state['msg_time'] = time.time()
 
     def _detect_loop(self):
         """Детекция YOLO в отдельном потоке.
@@ -712,22 +731,13 @@ class VisionLoop:
                                 if detected_at - self.last_target_at >= self.TARGET_TIMEOUT:
                                     self._reset_pid()
                                 self.last_target_at = detected_at
+                                self.target_available = True
                                 error = math.atan2(target_x, target_z)
                                 steer_k = target_wp.get('steer_k', 2.0)
                                 steering = self._pid_steering(error, steer_k, detected_at)
                                 self.last_steering = steering
-                                try:
-                                    pwm = self._autopilot_pwm()
-                                    self.car.update_pwm(pwm, steering)
-                                except TimeoutError as exc:
-                                    self.car.stop()
-                                    self._reset_pid()
-                                    self.robot_state['auto_mode'] = False
-                                    self.robot_state['msg'] = str(exc)
-                                    self.robot_state['msg_time'] = time.time()
                             else:
-                                self.car.update(0.0, self.last_steering)
-                                self.speed_controller.reset()
+                                self._stop_for_missing_target()
 
                     self.last_detections = detections
                     self.last_track_geometry = track
@@ -920,7 +930,7 @@ def main():
     
     try:
         while running:
-            loop.check_target_timeout()
+            loop.update_autopilot_speed()
             try:
                 data, addr = sock.recvfrom(1024)
                 last_addr = addr

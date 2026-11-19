@@ -110,13 +110,11 @@ class Config:
         self.max_depth = ap['max_depth']
         self.min_depth = ap['min_depth']
         self.track_width = ap['track_width']
-        geometry = cfg.get('track_geometry', {})
-        self.track_geometry = {}
-        for key, default in (('max_cone_gap_m', 2.0), ('boundary_clearance_m', 0.25)):
-            value = geometry.get(key, default)
-            if type(value) not in (int, float) or not math.isfinite(value) or value <= 0:
-                raise ValueError(f'track_geometry.{key} must be positive and finite')
-            self.track_geometry[key] = value
+        self.track_path = cfg.get('track_path', {})
+        for key, default in (('match_tolerance_m', 0.20), ('motion_min_radius_m', 0.0)):
+            value = self.track_path.setdefault(key, default)
+            if type(value) not in (int, float) or not math.isfinite(value) or value < 0:
+                raise ValueError(f'track_path.{key} must be finite and nonnegative')
         self.lookahead_distance = ap['lookahead_distance']
         self.pair_z_tolerance = ap['pair_z_tolerance']
         self.pair_x_tolerance_multiplier = ap['pair_x_tolerance_multiplier']

@@ -4,7 +4,7 @@
 В ручном режиме принимает команды по UDP и передаёт их Arduino по UART.
 В авторежиме YOLO распознаёт конусы на кадрах ZED в отдельном потоке.
 По площади рамок сервер оценивает расстояние до конусов, строит траекторию
-по сине-жёлтым парам или одиночным конусам и управляет рулём через ПИД.
+по сине-жёлтым парам. Стрим и регулятор руля используют одну траекторию.
 Ближний оранжевый конус завершает заезд.
 
 Настройки загружаются из config.jsonc. Видео доступно через веб-интерфейс
@@ -34,7 +34,7 @@ except:
 from Code.Config_load import Config
 from Code.Car_control import CarController
 from Code.Speed_control import SpeedController
-from Code.Track_geometry import build_track_geometry
+from Code.Track_path import TrackPath
 from Code.Cone_detector import ConeDetector
 from Code.Web import start, set_frame
 
@@ -74,11 +74,8 @@ class VisionLoop:
         self.process_every = 1
         self.last_detection_at = 0.0
         self.last_detections = []
-        self.last_track_geometry = None
-        self.smoothed_target = None
-        self.smoothed_target_at = 0.0
+        self.track_path = TrackPath(config, self.TARGET_TIMEOUT)
         self.last_target_z = None
-        self.last_target_detected = False
        
         if not os.path.exists(self.config.output_folder):
             os.makedirs(self.config.output_folder)
@@ -221,6 +218,10 @@ class VisionLoop:
 
             # Пересчёт координат обратно к полному кадру image_np
             # detect_frame был уменьшен (resize) и обрезан (crop_top)
+            detect_h, detect_w = detect_frame.shape[:2]
+            for det in detections:
+                x1, y1, x2, y2 = det['bbox']
+                det['clipped'] = min(x1, y1, detect_w - x2, detect_h - y2) <= 2
             if detect_frame.shape[1] != full_size[0] or detect_frame.shape[0] != full_size[1]:
                 scale_x = full_size[0] / detect_frame.shape[1]
                 scale_y = full_size[1] / pre_crop_h
@@ -359,81 +360,22 @@ class VisionLoop:
         change = max(-max_step, min(max_step, desired - self.last_steering))
         return self.last_steering + change
 
-    def _draw_track_geometry(self, image, track, detections):
-        if track is None:
+    def _draw_track_path(self, image):
+        points, floor = self.track_path.points, self.track_path.floor
+        if points is None or floor is None:
             return
-        bases = {tuple(det['pos_3d']): (det['center'][0], det['bbox'][3])
-                 for det in detections if 'pos_3d' in det}
-        floor_samples = []
-        for line, color in ((track.blue, (255, 125, 40)), (track.yellow, (0, 225, 255))):
-            pixels = []
-            for x, z in line:
-                base = bases.get((x, z))
-                if base is not None:
-                    pixels.append(base)
-                    floor_samples.append((1 / (z + self.config.camera_offset_z), base[1]))
-            if len(pixels) >= 2:
-                cv2.polylines(image, [np.rint(pixels).astype(np.int32)],
-                              False, color, 3, cv2.LINE_AA)
-
-        if track.center is None or len(floor_samples) < 2:
+        slope, horizon = floor
+        z_cam = points[:, 1] + self.config.camera_offset_z
+        valid = z_cam > 0.05
+        z_cam = z_cam[valid]
+        if len(z_cam) < 2:
             return
-
-        # Для плоской трассы высота на кадре линейна по обратной глубине.
-        # Восстанавливаем её по основаниям конусов, без вида сверху или произвольного наклона.
-        inverse_z, rows = np.asarray(floor_samples).T
-        floor_projection = np.column_stack((inverse_z, np.ones_like(inverse_z)))
-        slope, horizon = np.linalg.lstsq(floor_projection, rows, rcond=None)[0]
-        x_cam = track.center[:, 0] - self.config.camera_offset_x
-        z_cam = track.center[:, 1] + self.config.camera_offset_z
+        x_cam = points[valid, 0] - self.config.camera_offset_x
         u = self.fx * x_cam / z_cam + self.cx_cam
         v = slope / z_cam + horizon
         pixels = np.rint(np.column_stack((u, v))).astype(np.int32)
         cv2.polylines(image, [pixels], False, self.config.trajectory_color,
                       self.config.trajectory_thickness, cv2.LINE_AA)
-
-    def _smooth_target(self, waypoint, captured_at):
-        point = (waypoint['x'], waypoint['z'], waypoint['image_v'])
-        dt = captured_at - self.smoothed_target_at
-        if self.smoothed_target is not None and 0 < dt < self.TARGET_TIMEOUT:
-            alpha = -math.expm1(-min(dt, 0.1) / self.config.target_smoothing_s)
-            point = tuple(old + alpha * (new - old)
-                          for old, new in zip(self.smoothed_target, point))
-        self.smoothed_target = point
-        self.smoothed_target_at = captured_at
-        return point
-
-    def _select_lookahead_target(self, waypoints_3d, lookahead):
-        """Интерполяция цели по продольной дистанции между точками пути."""
-        if not waypoints_3d:
-            return None
-        
-        # Адаптируем дистанцию упреждения под скорость (если pure_pursuit_alpha > 0)
-        if hasattr(self.config, 'pure_pursuit_alpha') and self.config.pure_pursuit_alpha > 0:
-            # Предполагаем, что скорость пропорциональна forward_speed (условно)
-            speed_factor = self.config.forward_speed / 1570.0  # Нормализация к базовой скорости
-            adjusted_lookahead = lookahead * (1.0 + self.config.pure_pursuit_alpha * (speed_factor - 1.0))
-        else:
-            adjusted_lookahead = lookahead
-        
-        if adjusted_lookahead <= waypoints_3d[0]['z']:
-            return waypoints_3d[0]
-        for near, far in zip(waypoints_3d, waypoints_3d[1:]):
-            if near['z'] < adjusted_lookahead <= far['z']:
-                weight = (adjusted_lookahead - near['z']) / (far['z'] - near['z'])
-                near_z_cam = near['z'] + self.config.camera_offset_z
-                far_z_cam = far['z'] + self.config.camera_offset_z
-                target_z_cam = adjusted_lookahead + self.config.camera_offset_z
-                # Интерполируем высоту в пространстве и проецируем обратно в кадр.
-                image_v = ((1 - weight) * near['image_v'] * near_z_cam +
-                           weight * far['image_v'] * far_z_cam) / target_z_cam
-                return {
-                    'x': near['x'] + weight * (far['x'] - near['x']),
-                    'z': adjusted_lookahead,
-                    'image_v': image_v,
-                    'steer_k': min(near.get('steer_k', 2.0), far.get('steer_k', 2.0)),
-                }
-        return waypoints_3d[-1]
 
     def _draw_overlay(self, image_np, detections):
         for det in detections:
@@ -595,7 +537,6 @@ class VisionLoop:
 
                 detections = self.last_detections
                 target_z = self.last_target_z
-                target_detected = self.last_target_detected
 
                 # Забираем свежий результат детекции, если детектор успел его посчитать
                 fresh_detections = None
@@ -605,7 +546,8 @@ class VisionLoop:
                     except queue.Empty:
                         break
 
-                if fresh_detections is not None:
+                if (fresh_detections is not None and
+                        time.monotonic() - detected_at < self.TARGET_TIMEOUT):
                     profile = self.robot_state['autopilot_mode']
                     self.last_detection_at = detected_at
                     detections = fresh_detections
@@ -629,94 +571,31 @@ class VisionLoop:
                             # Переводим координаты левого объектива в систему машинки.
                             det['pos_3d'] = (x_cam + self.config.camera_offset_x, z - self.config.camera_offset_z)
                             
-                            if cone_name in self.config.blue_cones:
+                            if cone_name in self.config.blue_cones and not det['clipped']:
                                 blue_cones.append(det)
-                            elif cone_name in self.config.yellow_cones:
+                            elif cone_name in self.config.yellow_cones and not det['clipped']:
                                 yellow_cones.append(det)
                             elif cone_name in self.config.orange_cones:
                                 orange_cones.append(det)
 
-                    waypoints_3d = []
-                    
-                    # Сортируем только конусы с вычисленной 3D-позицией (защита от KeyError)
-                    blue_cones = sorted((c for c in blue_cones if 'pos_3d' in c), key=lambda c: c['pos_3d'][1])
-                    yellow_cones = sorted((c for c in yellow_cones if 'pos_3d' in c), key=lambda c: c['pos_3d'][1])
-                    orange_cones = [c for c in orange_cones if 'pos_3d' in c]
-                    
-                    used_yellows = set()
-                    pairs_found_count = 0
-                    track = build_track_geometry(blue_cones, yellow_cones,
-                                                 self.config.track_width, self.config.track_geometry)
-                    
-                    for b_cone in blue_cones:
-                        best_y = None
-                        best_diff = float('inf')
-                        b_x, b_z = b_cone['pos_3d']
-                        
-                        for i, y_cone in enumerate(yellow_cones):
-                            if i in used_yellows: continue
-                            y_x, y_z = y_cone['pos_3d']
-                            
-                            z_diff = abs(b_z - y_z)
-                            x_dist = abs(b_x - y_x) 
-                            
-                            if z_diff < self.config.pair_z_tolerance and x_dist < (self.config.track_width * self.config.pair_x_tolerance_multiplier):
-                                if z_diff < best_diff:
-                                    best_diff = z_diff
-                                    best_y = (i, y_cone)
-                        
-                        if best_y:
-                            y_idx, y_cone = best_y
-                            used_yellows.add(y_idx)
-                            y_x, y_z = y_cone['pos_3d']
-                            
-                            mid_x = (b_x + y_x) / 2.0
-                            mid_z = (b_z + y_z) / 2.0
-                            # Проекция середины пары по основаниям bbox с учётом глубины.
-                            image_v = (b_cone['bbox'][3] * b_cone['z_cam'] +
-                                       y_cone['bbox'][3] * y_cone['z_cam']) / (
-                                           b_cone['z_cam'] + y_cone['z_cam'])
-                            waypoints_3d.append({'x': mid_x, 'z': mid_z, 'image_v': image_v,
-                                                 'type': 'pair', 'b_cone': b_cone, 'y_cone': y_cone})
-                            pairs_found_count += 1
-
-                    if pairs_found_count == 0:
-                        for b_cone in blue_cones:
-                            b_x, b_z = b_cone['pos_3d']
-                            waypoints_3d.append({'x': b_x + self.config.virtual_point_offset, 'z': b_z,
-                                                 'image_v': b_cone['bbox'][3], 'type': 'virtual_blue',
-                                                 'steer_k': self.config.virtual_steer_k})
-                            
-                        for i, y_cone in enumerate(yellow_cones):
-                            if i not in used_yellows:
-                                y_x, y_z = y_cone['pos_3d']
-                                waypoints_3d.append({'x': y_x - self.config.virtual_point_offset, 'z': y_z,
-                                                     'image_v': y_cone['bbox'][3], 'type': 'virtual_yellow',
-                                                     'steer_k': self.config.virtual_steer_k})
-
-                    waypoints_3d.sort(key=lambda wp: wp['z'])
-
+                    finish = None
                     target_detected = False
                     if orange_cones:
                         closest_orange = min(orange_cones, key=lambda c: c['pos_3d'][1])
                         distance_from_front = closest_orange['z_cam'] - self.config.camera_to_front_m
-                        if distance_from_front < 2.0:
-                            # На финишном участке ориентируемся только на стоп-конус.
-                            o_x, o_z = closest_orange['pos_3d']
-                            waypoints_3d = [{'x': o_x, 'z': o_z,
-                                             'image_v': closest_orange['bbox'][3], 'type': 'stop'}]
+                        if distance_from_front < 2.0 and not closest_orange['clipped']:
+                            finish = closest_orange
                         if distance_from_front < self.config.stop_cone_z_threshold:
                             target_detected = True
 
-                    target_x, target_z = None, None
-                    target_wp = None
-                    if waypoints_3d:
-                        # Pure Pursuit: выбираем точку на дистанции упреждения
-                        target_wp = self._select_lookahead_target(waypoints_3d, self.config.lookahead_distance)
-                        if target_wp and target_wp['z'] > 0:
-                            target_x, target_z, _ = self._smooth_target(target_wp, detected_at)
-                        
-                    # УПРАВЛЕНИЕ 
+                    # Plan in the coordinate frame of the latest detection.
+                    auto = self.robot_state['auto_mode']
+                    self.track_path.update(blue_cones, yellow_cones, finish, detected_at,
+                                           self.car.get_speed() if auto else 0.,
+                                           self.last_steering if auto else 0.)
+                    target = self.track_path.target(self.config.lookahead_distance)
+                    target_z = target[1] if target is not None else None
+
                     with self.control_lock:
                         if (self.robot_state['auto_mode'] and
                                 self.robot_state['autopilot_mode'] == profile and
@@ -727,27 +606,27 @@ class VisionLoop:
                                 self.car.stop()
                                 self.robot_state['msg'] = "ФИНИШ! ОРАНЖЕВЫЙ КОНУС."
                                 self.robot_state['msg_time'] = time.time()
-                            elif target_x is not None and target_z > 0:
+                            elif (target is not None and
+                                  time.monotonic() - self.track_path.observed_at < self.TARGET_TIMEOUT):
                                 if detected_at - self.last_target_at >= self.TARGET_TIMEOUT:
                                     self._reset_pid()
-                                self.last_target_at = detected_at
+                                # Prediction must not extend the timeout of the last valid observation.
+                                self.last_target_at = max(self.last_target_at, self.track_path.observed_at)
                                 self.target_available = True
+                                target_x, target_z = target
                                 error = math.atan2(target_x, target_z)
-                                steer_k = target_wp.get('steer_k', 2.0)
-                                steering = self._pid_steering(error, steer_k, detected_at)
+                                steering = self._pid_steering(error, 1.0, detected_at)
                                 self.last_steering = steering
                             else:
                                 self._stop_for_missing_target()
 
                     self.last_detections = detections
-                    self.last_track_geometry = track
                     self.last_target_z = target_z
-                    self.last_target_detected = target_detected
 
                 if time.monotonic() - self.last_detection_at >= self.TARGET_TIMEOUT:
                     detections = []
                     target_z = None
-                    self.last_track_geometry = None
+                    self.track_path.reset()
 
                 # FPS
                 fps_counter += 1
@@ -768,7 +647,7 @@ class VisionLoop:
                 publish_phase -= self.config.zed_fps
                 self._draw_overlay(image_np, detections)
                 if self.config.draw_trajectory:
-                    self._draw_track_geometry(image_np, self.last_track_geometry, detections)
+                    self._draw_track_path(image_np)
 
                 rec_x = 10
                 if self.config.draw_fps:
@@ -890,8 +769,7 @@ class VisionLoop:
         # Пересоздаём объекты
         self.running = True
         self.last_detection_at = 0.0
-        self.last_track_geometry = None
-        self.smoothed_target = None
+        self.track_path.reset()
         self.is_recording = False
         self.fx = 0
         self.cx_cam = 0

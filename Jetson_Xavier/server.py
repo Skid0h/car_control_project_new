@@ -55,6 +55,8 @@ def draw_outlined_text(image, text, origin, scale, color, thickness):
 
 class VisionLoop:
     TARGET_TIMEOUT = 0.5
+    FINISH_CONFIRM_S = 0.20
+    FINISH_APPROACH_M = 2.0
 
     def __init__(self, config, detector, car, robot_state):
         self.config = config
@@ -63,6 +65,7 @@ class VisionLoop:
         self.robot_state = robot_state
         self.control_lock = threading.Lock()
         self.last_target_at = None
+        self.finish_seen = None
         self.target_available = False
         self.last_steering = 0.0
 
@@ -120,6 +123,7 @@ class VisionLoop:
                 self.car.stop()
                 self._reset_pid()
                 self.last_target_at = time.monotonic()
+                self.finish_seen = None
                 self.target_available = False
                 self.last_steering = 0.0
                 self.robot_state['auto_mode'] = True
@@ -149,6 +153,19 @@ class VisionLoop:
                 if self.robot_state['auto_mode']:
                     self.car.stop()
             self.robot_state['msg'] = ''
+
+    def _finish_confirmed(self, in_range, captured_at):
+        if not in_range:
+            self.finish_seen = None
+            return False
+
+        first_seen = captured_at
+        if self.finish_seen is not None:
+            first, previous = self.finish_seen
+            if captured_at < previous + self.FINISH_CONFIRM_S:
+                first_seen = first
+        self.finish_seen = first_seen, captured_at
+        return captured_at >= first_seen + self.FINISH_CONFIRM_S
 
     def _autopilot_pwm(self):
         profile = self.robot_state['autopilot_mode']
@@ -224,6 +241,10 @@ class VisionLoop:
             for det in detections:
                 x1, y1, x2, y2 = det['bbox']
                 det['clipped'] = min(x1, y1, detect_w - x2, detect_h - y2) <= 2
+                width = max(1, x2 - x1)
+                height = max(1, y2 - y1)
+                det['edge_clearance'] = min(x1 / width, (detect_w - x2) / width,
+                                            (detect_h - y2) / height)
             if detect_frame.shape[1] != full_size[0] or detect_frame.shape[0] != full_size[1]:
                 scale_x = full_size[0] / detect_frame.shape[1]
                 scale_y = full_size[1] / pre_crop_h
@@ -363,30 +384,33 @@ class VisionLoop:
         return self.last_steering + change
 
     def _draw_track_path(self, image):
-        points = self.track_path.points
-        if points is None:
+        confirmed, forecast = self.track_path.display_paths(time.monotonic())
+        if confirmed is None and forecast is None:
             return
-        center = self.track_path.pair_center()
         depth, row = self.track_path.floor_reference
         if self.track_path.floor is not None:
-            slope, horizon = self.track_path.floor
-            if center is not None:
-                horizon = row - slope / depth
+            slope, _ = self.track_path.floor
+            horizon = row - slope / depth
         else:
-            # С одной точки опоры горизонт можно только оценить для отрисовки.
             horizon = min(image.shape[0] / 2, row - 1.)
             slope = (row - horizon) * depth
-        z_cam = points[:, 1] + self.config.camera_offset_z
-        valid = z_cam > 0.05
-        z_cam = z_cam[valid]
-        if len(z_cam) < 2:
-            return
-        x_cam = points[valid, 0] - self.config.camera_offset_x
-        u = self.fx * x_cam / z_cam + self.cx_cam
-        v = slope / z_cam + horizon
-        pixels = np.rint(np.column_stack((u, v))).astype(np.int32)
-        cv2.polylines(image, [pixels], False, self.config.trajectory_color,
-                      self.config.trajectory_thickness, cv2.LINE_AA)
+
+        for points, color in ((confirmed, self.config.trajectory_color), (forecast, (0, 0, 255))):
+            if points is None:
+                continue
+            z_cam = points[:, 1] + self.config.camera_offset_z
+            valid = z_cam > 0.05
+            z_cam = z_cam[valid]
+            if len(z_cam) < 2:
+                continue
+            x_cam = points[valid, 0] - self.config.camera_offset_x
+            u = self.fx * x_cam / z_cam + self.cx_cam
+            v = slope / z_cam + horizon
+            pixels = np.rint(np.column_stack((u, v))).astype(np.int32)
+            cv2.polylines(image, [pixels], False, color,
+                          self.config.trajectory_thickness, cv2.LINE_AA)
+
+        center = self.track_path.pair_center() if confirmed is not None else None
         if center is not None:
             marker_depth = center[1] + self.config.camera_offset_z
             marker_x = self.fx * (center[0] - self.config.camera_offset_x) / marker_depth + self.cx_cam
@@ -571,7 +595,8 @@ class VisionLoop:
                     detections = fresh_detections
                     blue_cones = []
                     yellow_cones = []
-                    orange_cones = []
+                    orange_in_range = False
+                    finish = None
                     
                     for det in detections:
                         x1, y1, x2, y2 = det['bbox']
@@ -594,23 +619,18 @@ class VisionLoop:
                             elif cone_name in self.config.yellow_cones and not det['clipped']:
                                 yellow_cones.append(det)
                             elif cone_name in self.config.orange_cones:
-                                orange_cones.append(det)
+                                distance_from_front = z - self.config.camera_to_front_m
+                                if distance_from_front < self.config.stop_cone_z_threshold:
+                                    orange_in_range = True
+                                if (distance_from_front < self.FINISH_APPROACH_M and not det['clipped']
+                                        and (finish is None or z < finish['z_cam'])):
+                                    finish = det
 
-                    finish = None
-                    target_detected = False
-                    if orange_cones:
-                        closest_orange = min(orange_cones, key=lambda c: c['pos_3d'][1])
-                        distance_from_front = closest_orange['z_cam'] - self.config.camera_to_front_m
-                        if distance_from_front < 2.0 and not closest_orange['clipped']:
-                            finish = closest_orange
-                        if distance_from_front < self.config.stop_cone_z_threshold:
-                            target_detected = True
-
-                    # Plan in the coordinate frame of the latest detection.
+                    # Подвод к конусу и подтверждение остановки используют разные пороги.
                     auto = self.robot_state['auto_mode']
-                    self.track_path.update(blue_cones, yellow_cones, finish, detected_at,
+                    self.track_path.update(blue_cones, yellow_cones, detected_at,
                                            self.car.get_speed() if auto else 0.,
-                                           self.last_steering if auto else 0.)
+                                           self.last_steering if auto else 0., finish=finish)
                     target = self.track_path.target(self.config.lookahead_distance)
                     target_z = target[1] if target is not None else None
 
@@ -619,9 +639,11 @@ class VisionLoop:
                                 self.robot_state['autopilot_mode'] == profile and
                                 detected_at >= self.last_target_at and
                                 time.monotonic() - detected_at < self.TARGET_TIMEOUT):
-                            if target_detected:
+                            if self._finish_confirmed(orange_in_range, detected_at):
                                 self.robot_state['auto_mode'] = False
+                                self.target_available = False
                                 self.car.stop()
+                                self._reset_pid()
                                 self.robot_state['msg'] = "ФИНИШ! ОРАНЖЕВЫЙ КОНУС."
                                 self.robot_state['msg_time'] = time.time()
                             elif (target is not None and
@@ -644,7 +666,7 @@ class VisionLoop:
                 if time.monotonic() - self.last_detection_at >= self.TARGET_TIMEOUT:
                     detections = []
                     target_z = None
-                    self.track_path.reset()
+                    self.track_path.reset(keep_preview=True)
 
                 # FPS
                 fps_counter += 1
@@ -703,7 +725,13 @@ class VisionLoop:
                     draw_outlined_text(image_np, f"AUTO PWM: {pwm}", (10, 145),
                                        self.config.speed_text_scale, self.config.speed_text_color,
                                        self.config.speed_text_thickness)
-                    turn = self.track_path.turn_percent()
+                    turn = self.track_path.turn_percent(time.monotonic())
+                    if any(
+                        det.get('name') in self.config.orange_cones and
+                        det.get('z_cam', math.inf) - self.config.camera_to_front_m < self.FINISH_APPROACH_M
+                        for det in detections
+                    ):
+                        turn = 50.
                     turn_text = "--" if turn is None else f"{turn:.0f}%"
                     draw_outlined_text(image_np, f"TURN: {turn_text}", (10, 175),
                                        self.config.speed_text_scale, self.config.speed_text_color,

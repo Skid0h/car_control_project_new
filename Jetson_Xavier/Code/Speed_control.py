@@ -1,4 +1,6 @@
 class SpeedController:
+    MAX_SAMPLE_AGE_S = 0.75
+
     def __init__(self, settings):
         self.settings = settings
         self.reset()
@@ -16,11 +18,15 @@ class SpeedController:
             self.pwm = cfg['start_pwm']
             self.started_at = now
             self.last_step_at = now
-        fresh_speed = sampled_at > self.started_at and now - sampled_at < cfg['sensor_timeout_s']
+        fresh_speed = sampled_at > self.started_at and now - sampled_at < self.MAX_SAMPLE_AGE_S
         if fresh_speed:
             self.has_speed_sample = True
         elif self.has_speed_sample:
-            raise TimeoutError('Потеря телеметрии скорости')
+            # Возобновляем движение с начала разгона только по свежей скорости.
+            self.pwm = cfg['start_pwm']
+            self.last_step_at = now
+            self.in_startup = True
+            return None
         elif now - self.started_at >= cfg['startup_timeout_s']:
             raise TimeoutError('Нет свежей скорости после старта')
 

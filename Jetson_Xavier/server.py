@@ -157,7 +157,9 @@ class VisionLoop:
             return self.config.forward_speed
         if profile == 'MANUAL' and self.robot_state['target_speed_kmh'] > 0:
             speed, sampled_at = self.car.get_speed_sample()
-            return self.speed_controller.update(time.monotonic(), speed, sampled_at)
+            pwm = self.speed_controller.update(time.monotonic(), speed, sampled_at)
+            if pwm is not None:
+                return pwm
         return self.config.neutral_speed
 
     def _camera_lost(self):
@@ -361,10 +363,19 @@ class VisionLoop:
         return self.last_steering + change
 
     def _draw_track_path(self, image):
-        points, floor = self.track_path.points, self.track_path.floor
-        if points is None or floor is None:
+        points = self.track_path.points
+        if points is None:
             return
-        slope, horizon = floor
+        center = self.track_path.pair_center()
+        depth, row = self.track_path.floor_reference
+        if self.track_path.floor is not None:
+            slope, horizon = self.track_path.floor
+            if center is not None:
+                horizon = row - slope / depth
+        else:
+            # С одной точки опоры горизонт можно только оценить для отрисовки.
+            horizon = min(image.shape[0] / 2, row - 1.)
+            slope = (row - horizon) * depth
         z_cam = points[:, 1] + self.config.camera_offset_z
         valid = z_cam > 0.05
         z_cam = z_cam[valid]
@@ -376,6 +387,13 @@ class VisionLoop:
         pixels = np.rint(np.column_stack((u, v))).astype(np.int32)
         cv2.polylines(image, [pixels], False, self.config.trajectory_color,
                       self.config.trajectory_thickness, cv2.LINE_AA)
+        if center is not None:
+            marker_depth = center[1] + self.config.camera_offset_z
+            marker_x = self.fx * (center[0] - self.config.camera_offset_x) / marker_depth + self.cx_cam
+            marker_y = slope / marker_depth + horizon
+            cv2.circle(image, (round(marker_x), round(marker_y)),
+                       max(3, 2 * self.config.trajectory_thickness),
+                       self.config.trajectory_color, -1, cv2.LINE_AA)
 
     def _draw_overlay(self, image_np, detections):
         for det in detections:
@@ -511,9 +529,9 @@ class VisionLoop:
                 # Сохраняем размеры до кропа для корректного пересчёта координат
                 pre_crop_h = detect_frame.shape[0]
                 crop_top = int(pre_crop_h * 0.20)
-                crop_bottom = int(pre_crop_h * 0.20)
-                if crop_top > 0 or crop_bottom > 0:
-                    detect_frame = detect_frame[crop_top:pre_crop_h - crop_bottom, :]
+                # Ближние конусы находятся у нижнего края исходного кадра.
+                if crop_top > 0:
+                    detect_frame = detect_frame[crop_top:, :]
 
                 self.frame_counter += 1
                 should_process = (self.frame_counter % self.process_every) == 0
@@ -683,6 +701,11 @@ class VisionLoop:
                     if pwm is None:
                         pwm = self.config.neutral_speed
                     draw_outlined_text(image_np, f"AUTO PWM: {pwm}", (10, 145),
+                                       self.config.speed_text_scale, self.config.speed_text_color,
+                                       self.config.speed_text_thickness)
+                    turn = self.track_path.turn_percent()
+                    turn_text = "--" if turn is None else f"{turn:.0f}%"
+                    draw_outlined_text(image_np, f"TURN: {turn_text}", (10, 175),
                                        self.config.speed_text_scale, self.config.speed_text_color,
                                        self.config.speed_text_thickness)
 

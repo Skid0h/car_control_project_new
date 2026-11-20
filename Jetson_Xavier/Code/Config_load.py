@@ -78,7 +78,7 @@ class Config:
             if type(speed[key]) is not int:
                 raise ValueError(f'auto_speed.{key} должно быть целым числом')
         for key in ('target_kmh', 'step_pwm', 'increase_interval_s', 'decrease_interval_s',
-                    'startup_timeout_s', 'sensor_timeout_s', 'ramp_interval_s'):
+                    'startup_timeout_s', 'ramp_interval_s'):
             if speed[key] <= 0:
                 raise ValueError(f'auto_speed.{key} должно быть положительным')
         if not 0 <= speed['deadband_kmh'] < speed['target_kmh']:
